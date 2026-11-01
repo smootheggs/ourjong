@@ -33,6 +33,7 @@ import type {
   Player,
   GameAction,
   GameState,
+  Ledger,
   MatchStatus,
   Meld,
   Payment,
@@ -43,9 +44,10 @@ import type {
   WindName,
   WinContext,
 } from "@ourjong/engine";
-import { WALL_STACKS_PER_SIDE } from "@ourjong/engine";
+import { WALL_STACKS_PER_SIDE, describeLedgerEntry } from "@ourjong/engine";
 import type { DiceRollResult } from "@ourjong/engine";
 import { playSound } from "../audio";
+import { useSession } from "../session";
 import { DiceRoll } from "./Dice";
 import type { DiceAction, DiceFlowState } from "../diceFlow";
 import { TileView } from "./TileView";
@@ -1053,6 +1055,96 @@ function RiskMeter({ value }: { value: number }) {
   );
 }
 
+/** True while the screen matches a media query (e.g. a short landscape phone). */
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia?.(query).matches ?? false);
+  useEffect(() => {
+    const list = window.matchMedia?.(query);
+    if (!list) return undefined;
+    const update = () => setMatches(list.matches);
+    update();
+    list.addEventListener("change", update);
+    return () => list.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
+
+/**
+ * The Match Ledger: one line per finished hand, newest last. When recording is off it says so and
+ * shows nothing, because nothing was kept. Like every pop-up it never scrolls, so it shows the
+ * latest few hands (fewer on a short screen) and counts the rest.
+ */
+function LedgerModal({
+  state,
+  match,
+  ledgerOn,
+  ledger,
+  onClose,
+}: {
+  state: GameState;
+  match: MatchStatus;
+  ledgerOn: boolean;
+  ledger: Ledger;
+  onClose: () => void;
+}) {
+  const short = useMediaQuery("(max-height: 520px)");
+  const shown = ledger.slice(-(short ? 3 : 6));
+  const earlier = ledger.length - shown.length;
+  const nameOf = (seat: SeatIndex) => state.players[seat].name ?? `Player ${seat + 1}`;
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <ResultCard
+      label="Match ledger"
+      className="ourjong-panel-ledger"
+      glyph="錄"
+      title="Match Ledger"
+      subtitle={ledgerOn ? matchTitle(match) : undefined}
+      actionLabel="Close"
+      onAction={onClose}
+    >
+      {!ledgerOn ? (
+        <p className="ourjong-ledger-empty">Match recording disabled for privacy.</p>
+      ) : shown.length === 0 ? (
+        <p className="ourjong-ledger-empty">No hands recorded yet.</p>
+      ) : (
+        <ol className="ourjong-ledger" aria-label="Hands played">
+          {shown.map((entry) => {
+            const line = describeLedgerEntry(entry, nameOf);
+            return (
+              <li key={entry.key}>
+                <span className="ourjong-ledger-round">{line.label}</span>
+                <span className="ourjong-ledger-text">{line.text}</span>
+                {line.payouts.length > 0 && (
+                  <span className="ourjong-ledger-pay">
+                    {line.payouts.map((pay) => (
+                      <span key={pay} data-gain={!pay.includes("\u2212")}>
+                        {pay}
+                      </span>
+                    ))}
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+      {ledgerOn && earlier > 0 && (
+        <p className="ourjong-ledger-empty">
+          {earlier} earlier {earlier === 1 ? "hand" : "hands"} not shown.
+        </p>
+      )}
+    </ResultCard>
+  );
+}
+
 /**
  * The Coach's stop sign: the same glass card as the hand results, with the reasons, your tile
  * next to the one the Coach would throw, and two choices. Cancel is the main button (it is what the
@@ -1252,27 +1344,26 @@ function River({
 /* ---------- The compass in the middle of the table ---------- */
 
 /** Where each seat's wind sits around the compass, from the viewer's side. */
-const COMPASS_EDGES: readonly { offset: number; style: CSSProperties; score: CSSProperties }[] = [
-  // Top and bottom seats show the score beside the wind; left and right show it below.
+const COMPASS_EDGES: readonly { offset: number; style: CSSProperties; name: CSSProperties }[] = [
   {
     offset: 0,
     style: { bottom: "2%", left: "50%", transform: "translateX(-50%)" },
-    score: { bottom: "calc(2% + var(--r) * 0.32)", left: "calc(50% + var(--r) * 0.72)" },
+    name: { top: "calc(100% + var(--r) * 0.2)", left: 0, right: 0, justifyContent: "center" },
   },
   {
     offset: 1,
     style: { right: "2%", top: "50%", transform: "translateY(-50%)" },
-    score: { right: "2%", top: "calc(50% + var(--r) * 0.62)", width: "calc(var(--r) * 1.1)", justifyContent: "center" },
+    name: { left: "calc(100% + var(--r) * 0.2)", top: 0, bottom: 0, justifyContent: "flex-start" },
   },
   {
     offset: 2,
     style: { top: "2%", left: "50%", transform: "translateX(-50%)" },
-    score: { top: "calc(2% + var(--r) * 0.32)", left: "calc(50% + var(--r) * 0.72)" },
+    name: { bottom: "calc(100% + var(--r) * 0.2)", left: 0, right: 0, justifyContent: "center" },
   },
   {
     offset: 3,
     style: { left: "2%", top: "50%", transform: "translateY(-50%)" },
-    score: { left: "2%", top: "calc(50% + var(--r) * 0.62)", width: "calc(var(--r) * 1.1)", justifyContent: "center" },
+    name: { right: "calc(100% + var(--r) * 0.2)", top: 0, bottom: 0, justifyContent: "flex-end" },
   },
 ];
 
@@ -1514,7 +1605,9 @@ function Compass({
   dice,
   onDiceAction,
   holdDice,
+  onOpenLedger,
 }: {
+  onOpenLedger: () => void;
   state: GameState;
   mySeat: SeatIndex;
   activeSeat: SeatIndex | undefined;
@@ -1525,6 +1618,12 @@ function Compass({
   holdDice: boolean;
 }) {
   const status = matchStatus(state);
+  // Tapping any of the four wind pills fades the players' names in beside them (and out again).
+  const [showNames, setShowNames] = useState(false);
+  const toggleNames = (event: { stopPropagation: () => void }) => {
+    event.stopPropagation(); // the table behind passes a pending claim when tapped
+    setShowNames((on) => !on);
+  };
   // Nothing about the roll's outcome shows until the dice have stopped.
   const settled = dice?.settled ?? null;
   const outcomeKnown = dice === undefined || settled !== null;
@@ -1539,7 +1638,7 @@ function Compass({
   return (
     <div style={styles.compass} role="group" aria-label="Table compass">
       {settled && <WallRing roll={settled} mySeat={mySeat} wall={state.wall} dealt={deal.dealt} wave={deal.wave} />}
-      {COMPASS_EDGES.map(({ offset, style, score: scoreStyle }) => {
+      {COMPASS_EDGES.map(({ offset, style, name: nameStyle }) => {
         const seat = ((mySeat + offset) % 4) as SeatIndex;
         const player = state.players[seat];
         const on = seat === activeSeat;
@@ -1547,7 +1646,18 @@ function Compass({
         return (
           <Fragment key={seat}>
           <span
-            className={on ? "ourjong-turn" : undefined}
+            className={on ? "ourjong-turn ourjong-pill" : "ourjong-pill"}
+            role="button"
+            tabIndex={0}
+            aria-pressed={showNames}
+            aria-label={`${windTag(player.seatWind)}, ${playerTag(player, mySeat)}. Show or hide names`}
+            onClick={toggleNames}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                toggleNames(event);
+              }
+            }}
             style={{
               ...styles.compassEdge,
               ...style,
@@ -1563,23 +1673,54 @@ function Compass({
               </span>
             )}
           </span>
-          <span
-            style={{
-              ...styles.compassScore,
-              ...scoreStyle,
-              color: player.score > 0 ? "#bbf7d0" : player.score < 0 ? "#fecaca" : "rgba(244,239,224,0.6)",
-            }}
-            aria-label={`${playerTag(player, mySeat)} score ${signed(player.score)}`}
-          >
-            {signed(player.score)}
-          </span>
+          {(
+            // The row only places the name outside the circle (below you, above the player across,
+            // beside the other two); the chip inside does the fading. Always horizontal. The score
+            // lives here and nowhere else: it shows only while the names do.
+            () => {
+              const tag = player.name ?? playerTag(player, mySeat);
+              const tone = player.score > 0 ? "#bbf7d0" : player.score < 0 ? "#fecaca" : "rgba(244,239,224,0.7)";
+              return (
+                <span style={{ ...styles.compassNameRow, ...nameStyle }} aria-hidden={!showNames}>
+                  <span
+                    className="ourjong-name"
+                    data-shown={showNames}
+                    style={{ ...styles.compassName, ...(on ? styles.compassNameOn : null) }}
+                    aria-label={`${tag}, score ${signed(player.score)}`}
+                  >
+                    <span style={styles.compassNameText}>{tag}</span>
+                    <span style={{ ...styles.compassPoints, color: tone }}>
+                      {"\u00a0\u2022\u00a0"}
+                      {signed(player.score)}
+                    </span>
+                  </span>
+                </span>
+              );
+            }
+          )()}
           </Fragment>
         );
       })}
 
       {settled && <WallBreakMark roll={settled} mySeat={mySeat} />}
 
-      <div style={styles.compassCore}>
+      <div
+        className="ourjong-hub"
+        role="button"
+        tabIndex={0}
+        aria-label="Open match ledger"
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpenLedger();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onOpenLedger();
+          }
+        }}
+        style={styles.compassCore}
+      >
         <div style={styles.compassGlyph} aria-hidden="true">
           {WIND_GLYPHS[status.prevailingWind]}
         </div>
@@ -1811,6 +1952,8 @@ export function GameTable({
   const rolling = dice !== undefined && onDiceAction !== undefined && dice.isDiceRolling;
   const [toast, setToast] = useState<(ToastContent & { id: number }) | null>(null);
   // A discard the Coach stopped, waiting for "Discard Anyway" or "Cancel".
+  const { session } = useSession();
+  const [ledgerOpen, setLedgerOpen] = useState(false);
   const [coachStop, setCoachStop] = useState<{ tile: Tile; advice: DiscardAdvice } | null>(null);
   const seenActions = useRef(state.history.length);
   const me = state.players[mySeat];
@@ -2358,6 +2501,7 @@ export function GameTable({
                     dice={dice}
                     onDiceAction={onDiceAction}
                     holdDice={holdDice}
+                    onOpenLedger={() => setLedgerOpen(true)}
                   />
                 </div>
               </div>
@@ -2480,6 +2624,16 @@ export function GameTable({
         </div>
 
       </div>
+
+      {ledgerOpen && (
+        <LedgerModal
+          state={state}
+          match={match}
+          ledgerOn={session.ledgerOn}
+          ledger={session.ledger}
+          onClose={() => setLedgerOpen(false)}
+        />
+      )}
 
       {coachStop !== null && canDiscard && (
         <CoachWarning
@@ -2646,6 +2800,27 @@ const TABLE_CSS = `
 .ourjong-coach-side { display: flex; flex-direction: column; align-items: center; gap: 8px; min-width: 0; }
 .ourjong-coach-caption { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--oj-ink-dim); }
 .ourjong-coach-arrow { font-size: 1.4rem; color: var(--oj-ink-dim); }
+/* The Match Ledger: one wrapping row per hand (round, sentence, points). */
+.ourjong-ledger { list-style: none; margin: 0; padding: 0; width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.ourjong-ledger li { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; min-width: 0; padding: 8px 12px; box-sizing: border-box; border-radius: var(--oj-radius-sm); background: rgba(255,255,255,0.06); border: 1px solid var(--oj-line); text-align: left; }
+.ourjong-ledger-round { flex: none; min-width: 4.4em; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--oj-gold); }
+.ourjong-ledger-text { flex: 1 1 9em; min-width: 0; font-size: 0.92rem; line-height: 1.3; }
+.ourjong-ledger-pay { flex: 1 1 100%; min-width: 0; display: flex; flex-wrap: wrap; gap: 0 6px; padding-left: calc(4.4em + 10px); font-size: 0.82rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ourjong-ledger-pay > span[data-gain="true"] { color: #7ee2a1; }
+.ourjong-ledger-pay > span[data-gain="false"] { color: #ff9b86; }
+.ourjong-ledger-pay > span + span::before { content: "|"; margin-right: 6px; color: var(--oj-ink-dim); font-weight: 400; }
+@container ojscrim (max-width: 400px) { .ourjong-ledger-pay { padding-left: 0; } }
+.ourjong-ledger-empty { margin: 0; font-size: 0.92rem; line-height: 1.4; color: var(--oj-ink-dim); text-wrap: balance; }
+/* The compass: tappable hub (opens the ledger) and wind pills (show the names). */
+.ourjong-hub { border-radius: 50%; cursor: pointer; transition: transform 120ms ease, background 150ms ease; -webkit-tap-highlight-color: transparent; }
+.ourjong-hub:active { transform: scale(0.95); background: rgba(255,255,255,0.07); }
+.ourjong-pill { cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.ourjong-pill:active { filter: brightness(1.25); }
+.ourjong-hub:focus-visible, .ourjong-pill:focus-visible { outline: 2px solid #ffe3a1; outline-offset: 2px; }
+@media (hover: hover) { .ourjong-hub:hover { background: rgba(255,255,255,0.05); } .ourjong-pill:hover { filter: brightness(1.2); } }
+.ourjong-name { opacity: 0; transform: translateY(3px) scale(0.96); transition: opacity 220ms ease, transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.1); }
+.ourjong-name[data-shown="true"] { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) { .ourjong-name, .ourjong-hub { transition: none; } }
 .ourjong-risk { width: 100%; max-width: 116px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .ourjong-risk-track { width: 100%; height: 6px; border-radius: 3px; background: rgba(255,255,255,0.12); overflow: hidden; }
 .ourjong-risk-fill { height: 100%; border-radius: inherit; background: var(--risk); }
@@ -3292,9 +3467,11 @@ const styles: Record<string, CSSProperties> = {
     fontSize: "calc(var(--r) * 0.65)",
     fontWeight: 900,
     lineHeight: 1,
+    zIndex: 2,
     transition: "background 150ms ease, color 150ms ease, box-shadow 150ms ease",
   },
   compassEdgeOn: {
+    zIndex: 3,
     background: "#f2b134",
     color: "#1f2430",
     boxShadow: "0 0 calc(var(--r) * 0.8) rgba(242,177,52,0.75)",
@@ -3302,6 +3479,7 @@ const styles: Record<string, CSSProperties> = {
   compassEdgeWaiting: { boxShadow: "0 0 0 2px #5aa9ff, 0 0 12px rgba(90,169,255,0.6)" },
   compassDealer: {
     position: "absolute",
+    zIndex: 4,
     top: "-22%",
     left: "-22%",
     width: "46%",
@@ -3315,19 +3493,37 @@ const styles: Record<string, CSSProperties> = {
     alignItems: "center",
     justifyContent: "center",
   },
-  compassScore: {
+  compassNameRow: {
     position: "absolute",
+    zIndex: 5,
     display: "flex",
     alignItems: "center",
-    fontSize: "calc(var(--r) * 0.44)",
+    pointerEvents: "none",
+    writingMode: "horizontal-tb",
+  },
+  compassName: {
+    display: "flex",
+    alignItems: "baseline",
+    maxWidth: "calc(var(--r) * 3)",
+    padding: "calc(var(--r) * 0.08) calc(var(--r) * 0.3)",
+    borderRadius: 9999,
+    background: "rgba(0,0,0,0.55)",
+    color: "#f4efe0",
+    fontSize: "calc(var(--r) * 0.38)",
     fontWeight: 700,
-    letterSpacing: "0.02em",
-    lineHeight: 1,
-    fontVariantNumeric: "tabular-nums",
+    lineHeight: 1.15,
+    letterSpacing: "0.01em",
     whiteSpace: "nowrap",
+    overflow: "hidden",
     textShadow: "0 1px 2px rgba(0,0,0,0.7)",
   },
+  // A long name is shortened with an ellipsis; the points after it never are.
+  compassNameText: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" },
+  compassPoints: { flex: "none", fontVariantNumeric: "tabular-nums" },
+  compassNameOn: { color: "#ffd978" },
   compassCore: {
+    cursor: "pointer",
+    touchAction: "manipulation",
     position: "absolute",
     inset: "25% 23% 29%",
     display: "flex",
@@ -3365,7 +3561,10 @@ const styles: Record<string, CSSProperties> = {
     whiteSpace: "nowrap",
     pointerEvents: "none",
   },
-  wallRing: { position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" },
+  // Compass layers, bottom to top: the wall and its gold break tile (1), the wind pills (2) with the
+  // lit one above its neighbours (3), the dealer badge inside its pill (4). Names (5) and the roll
+  // pill sit above them all.
+  wallRing: { position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 1 },
   compassHand: { fontSize: "calc(var(--r) * 0.4)", opacity: 0.75, whiteSpace: "nowrap" },
   timerCompass: { display: "flex", flexDirection: "column", alignItems: "center", gap: "calc(var(--r) * 0.06)", width: "62%" },
   timerSeconds: {

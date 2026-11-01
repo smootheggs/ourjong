@@ -363,6 +363,7 @@ const pp: Record<string, CSSProperties> = {
   setup: {
     position: "absolute",
     inset: 0,
+    overflowX: "hidden",
     overflowY: "auto",
     display: "flex",
     justifyContent: "center",

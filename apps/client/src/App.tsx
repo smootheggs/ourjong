@@ -5,7 +5,10 @@ import type { GameAction, GameState, SeatIndex } from "@ourjong/engine";
 import { GameTable } from "./components/GameTable";
 import { Lobby } from "./components/Lobby";
 import { ReferenceGuide } from "./components/ReferenceGuide";
+import { PlayerSetupScreen } from "./components/PlayerSetup";
 import { TutorialSandbox } from "./components/TutorialSandbox";
+import { SessionProvider, resolveNames, useSession, useSessionStore } from "./session";
+import type { SeatNames } from "./session";
 import { DIFFICULTIES, loadDifficulty, saveDifficulty } from "./difficulty";
 import type { BotLevel } from "@ourjong/engine";
 import { INITIAL_DICE_FLOW, diceKeyOf, diceReducer, startRoll } from "./diceFlow";
@@ -17,11 +20,11 @@ import type { SeatSetup } from "./components/PassAndPlay";
  * Thin wrapper over the engine's pure reducer. The engine throws on illegal moves,
  * so the wrapper keeps the previous state instead of crashing the UI.
  */
-type AppAction = GameAction | { type: "new-game"; seed: string };
+type AppAction = GameAction | { type: "new-game"; seed: string; names?: SeatNames };
 
 function gameReducer(state: GameState, action: AppAction): GameState {
   // Starting from the menu always deals a fresh game.
-  if (action.type === "new-game") return createInitialState(action.seed);
+  if (action.type === "new-game") return createInitialState(action.seed, action.names);
   try {
     return processAction(state, action);
   } catch (error) {
@@ -42,12 +45,12 @@ function freshSeed(): string {
   return `${Date.now().toString(36)}-${bytes[0].toString(36)}${bytes[1].toString(36)}`;
 }
 
-function createInitialState(seed: string = freshSeed()): GameState {
-  return initializeHKOSGame("demo-game", ["p1", "p2", "p3", "p4"], seed);
+function createInitialState(seed: string = freshSeed(), names?: SeatNames): GameState {
+  return initializeHKOSGame("demo-game", ["p1", "p2", "p3", "p4"], seed, names);
 }
 
 /** "menu" is the landing screen; the rest are the pages the top bar switches between. */
-type View = "menu" | "setup" | "play" | "guide" | "tutorial";
+type View = "menu" | "setup" | "players" | "play" | "guide" | "tutorial";
 // "online" is still here, switched off for now: the menu offers Local and Pass & Play only.
 type Mode = "local" | "hotseat" | "online";
 
@@ -57,7 +60,21 @@ const MODES: readonly { id: Mode; label: string; hint: string }[] = [
   { id: "hotseat", label: "Pass & Play", hint: "Share one device, with bots in any empty seat" },
 ];
 
+/**
+ * The app. The session (names, the ledger switch and the ledger) is held here in React state only,
+ * so it outlives every hand and round and is gone when the app closes.
+ */
 export default function App() {
+  const store = useSessionStore();
+  return (
+    <SessionProvider value={store}>
+      <AppBody />
+    </SessionProvider>
+  );
+}
+
+function AppBody() {
+  const { session, dispatch: sessionDispatch } = useSession();
   // The local game lives here, so opening the guide never loses your hand. The table itself
   // is unmounted while the guide is open, which pauses the bots until you come back.
   const [state, dispatchToEngine] = useReducer(gameReducer, undefined, () => createInitialState());
@@ -155,17 +172,25 @@ export default function App() {
       return;
     }
     if (mode === "local") {
-      dispatchToEngine({ type: "new-game", seed: freshSeed() });
+      dispatchToEngine({ type: "new-game", seed: freshSeed(), names: resolveNames(session.names) });
+      sessionDispatch({ type: "clear-ledger" });
       setGameMode("local");
     }
     setView("play");
   };
   // Pass & Play: the seats are chosen, deal a fresh game.
   const dealHotseat = () => {
-    dispatchToEngine({ type: "new-game", seed: freshSeed() });
+    dispatchToEngine({ type: "new-game", seed: freshSeed(), names: resolveNames(session.names) });
+    sessionDispatch({ type: "clear-ledger" });
     setGameMode("hotseat");
     setView("play");
   };
+  // Every finished hand goes into the ledger (when it is on). Recording is idempotent, so this can
+  // run on every change of state: a hand that is already in the ledger is not added again.
+  useEffect(() => {
+    if (state.phase.type === "hand-end") sessionDispatch({ type: "record-hand", state });
+  }, [state, session.ledgerOn, sessionDispatch]);
+
   const resumable = mode === "online" ? seated : state.history.length > 0 && gameMode === mode;
 
   if (view === "menu") {
@@ -180,6 +205,21 @@ export default function App() {
           onOpen={setView}
           botLevel={botLevel}
           onBotLevel={setBotLevel}
+        />
+      </div>
+    );
+  }
+
+  if (view === "players") {
+    return (
+      <div style={styles.app}>
+        <style>{GLOBAL_CSS}</style>
+        <PlayerSetupScreen
+          names={session.names}
+          onName={(seat, name) => sessionDispatch({ type: "set-name", seat, name })}
+          ledgerOn={session.ledgerOn}
+          onLedger={(on) => sessionDispatch({ type: "set-ledger-on", on })}
+          onBack={() => setView("menu")}
         />
       </div>
     );
@@ -657,7 +697,9 @@ function MainMenu({
 }) {
   return (
     <main className="oj-menu" style={styles.menu}>
-      <div className="oj-menu-rings" style={styles.menuRings} aria-hidden="true" />
+      <div style={styles.menuRingsClip} aria-hidden="true">
+        <div className="oj-menu-rings" style={styles.menuRings} />
+      </div>
       <div className="oj-menu-body" style={styles.menuBody}>
         <div className="oj-menu-coin" style={styles.menuCoin} aria-hidden="true">
           麻
@@ -701,6 +743,12 @@ function MainMenu({
           <button type="button" className="oj-link" style={styles.menuLink} onClick={() => onOpen("tutorial")}>
             Tutorial Puzzles
           </button>
+          <span style={styles.menuDot} aria-hidden="true">
+            ·
+          </span>
+          <button type="button" className="oj-link" style={styles.menuLink} onClick={() => onOpen("players")}>
+            Players
+          </button>
         </div>
       </div>
     </main>
@@ -708,7 +756,12 @@ function MainMenu({
 }
 
 const GLOBAL_CSS = `
-html, body, #root { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #12382d; }
+html, body, #root { margin: 0; padding: 0; width: 100%; max-width: 100%; height: 100%; overflow: hidden; background: #12382d; }
+/* The viewport never moves sideways: nothing may widen the page, and no rubber-banding either.
+   Panels that really scroll (the guide, puzzles, setup screens) do so inside themselves, and only
+   vertically; anything wider than the screen (the menu's rings) is clipped by its own screen. */
+html, body { overflow-x: hidden; overscroll-behavior-x: none; position: relative; }
+.oj-menu, .oj-menu-body { max-width: 100%; }
 *, *::before, *::after { box-sizing: border-box; }
 button { font-family: inherit; }
 
@@ -920,11 +973,14 @@ const styles: Record<string, CSSProperties> = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    overflow: "auto",
+    overflowX: "clip", // the decorative rings are wider than a portrait tablet: clip them, never scroll
+    overflowY: "auto",
     padding: "clamp(16px, 4vmin, 48px)",
     background:
       "radial-gradient(ellipse at 50% 38%, #1f6b53 0%, #134a39 42%, #0b2a21 100%)",
   },
+  // The rings are bigger than a portrait tablet. This box clips them, and clipped overflow cannot be scrolled to.
+  menuRingsClip: { position: "absolute", inset: 0, overflow: "clip", pointerEvents: "none" },
   menuRings: {
     position: "absolute",
     left: "50%",
@@ -1054,8 +1110,21 @@ const styles: Record<string, CSSProperties> = {
   diffLabel: { fontSize: "0.72rem", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(244,239,224,0.6)" },
   diffTrack: { marginTop: 0, width: "100%" },
   diffOptionCompact: { flex: "1 1 auto", minWidth: 0, padding: "0 8px", fontSize: "0.78rem", letterSpacing: 0 },
-  diffHint: { fontSize: "0.8rem", color: "rgba(244,239,224,0.6)", textAlign: "center", maxWidth: 280, padding: "0 12px" },
-  menuLinks: { display: "flex", alignItems: "center", gap: 6, marginTop: "clamp(4px, 1.2vmin, 12px)" },
+  // Two lines tall whatever the hint says, so picking a difficulty never moves what is below it.
+  diffHint: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    boxSizing: "content-box",
+    height: "2.7em",
+    maxWidth: 280,
+    padding: "0 12px",
+    fontSize: "0.8rem",
+    lineHeight: 1.35,
+    color: "rgba(244,239,224,0.6)",
+    textAlign: "center",
+  },
+  menuLinks: { display: "flex", flexWrap: "wrap", justifyContent: "center", alignItems: "center", gap: 6, marginTop: "clamp(4px, 1.2vmin, 12px)" },
   menuLink: {
     border: "none",
     background: "transparent",

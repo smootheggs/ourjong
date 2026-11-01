@@ -153,11 +153,14 @@ export function dealNextHand(
  * - `id`: the game's identifier.
  * - `playerIds`: one id per seat, in seat order (East, South, West, North).
  * - `seed`: any string; the same seed always produces the same wall and deal.
+ * - `names`: optional display names, in seat order. A seat is a player's identity for the whole
+ *   match (only the seat *winds* rotate), and the name stays with the seat through every deal.
  */
 export function initializeHKOSGame(
   id: string,
   playerIds: readonly [string, string, string, string],
   seed: string,
+  names?: readonly [string, string, string, string],
 ): GameState {
   const rules = HKOS_RULES;
   const wall = shuffled(buildTileSet(rules), seededRandom(seed));
@@ -172,6 +175,9 @@ export function initializeHKOSGame(
     return {
       id: playerId,
       seat,
+      // Who is who. A seat never changes hands: only the seat wind rotates, so `seat` (0-3) is the
+      // player's stable identity for the whole match, and the name rides along with it.
+      ...(names?.[index] ? { name: names[index] } : {}),
       ...(seat === 0 ? {} : { difficulty: "medium" as const }),
       hand,
       drawnTile: null,
