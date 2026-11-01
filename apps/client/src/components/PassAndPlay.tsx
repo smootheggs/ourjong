@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
-import type { ClaimKind, GameAction, GameState, SeatIndex } from "@ourjong/engine";
+import type { BotLevel, ClaimKind, GameAction, GameState, SeatIndex } from "@ourjong/engine";
 import { GameTable } from "./GameTable";
+import type { DiceAction, DiceFlowState } from "../diceFlow";
 
 /**
  * Pass-and-play: one device, up to four people, bots in any seat that nobody is sitting at.
@@ -76,13 +77,21 @@ export function PassAndPlayTable({
   state,
   dispatch,
   humanSeats,
+  botLevel,
   emojis,
   onEmojiDone,
   onViewSeat,
+  dice,
+  onDiceAction,
 }: {
   state: GameState;
   dispatch: (action: GameAction) => void;
   humanSeats: readonly SeatIndex[];
+  /** How strong the bots are (the app's difficulty setting). */
+  botLevel?: BotLevel;
+  /** The opening roll; it waits behind the privacy screen so the person it is for sees it. */
+  dice?: DiceFlowState;
+  onDiceAction?: (action: DiceAction) => void;
   emojis?: Partial<Record<number, { id: number; emoji: string }>>;
   onEmojiDone?: (seat: number) => void;
   /** Reports whose hand is on screen, so the app can send emoji from the right seat. */
@@ -114,7 +123,11 @@ export function PassAndPlayTable({
         onPlayerAction={dispatch}
         mySeat={mySeat}
         humanSeats={humanSeats}
+        botLevel={botLevel}
         concealMine={concealMine || viewSeat === null}
+        dice={dice}
+        onDiceAction={onDiceAction}
+        holdDice={masked}
         emojis={emojis}
         onEmojiDone={onEmojiDone}
       />

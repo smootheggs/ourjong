@@ -48,7 +48,7 @@ const RANKS: readonly SuitRank[] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 /* ---------- Seeded randomness ---------- */
 
 /** Turns any string into a 32-bit seed (xmur3). */
-function hashSeed(text: string): number {
+export function hashSeed(text: string): number {
   let h = 1779033703 ^ text.length;
   for (let i = 0; i < text.length; i++) {
     h = Math.imul(h ^ text.charCodeAt(i), 3432918353);
@@ -60,7 +60,7 @@ function hashSeed(text: string): number {
 }
 
 /** Small, fast, deterministic generator returning numbers in [0, 1) (mulberry32). */
-function seededRandom(seed: string): () => number {
+export function seededRandom(seed: string): () => number {
   let a = hashSeed(seed);
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;

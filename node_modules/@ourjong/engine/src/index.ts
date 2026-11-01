@@ -5,3 +5,5 @@ export * from "./evaluator.ts";
 export * from "./moves.ts";
 export * from "./scoring.ts";
 export * from "./ai.ts";
+export * from "./dice.ts";
+export * from "./ai/index.ts";

@@ -7,8 +7,10 @@ import {
   canSelfDrawWin,
   canWin,
   fanForWin,
-  getBestClaim,
-  getBestDiscard,
+  adviseDiscard,
+  getBotAction,
+  nextBotAction,
+  recommendDiscard,
   getHiddenKongs,
   getPromotedKongs,
   LIMIT_HANDS,
@@ -23,7 +25,8 @@ import {
   shouldDeclareSelfDrawWin,
 } from "@ourjong/engine";
 import type {
-  BotDifficulty,
+  BotLevel,
+  DiscardAdvice,
   ClaimKind,
   ClaimOption,
   DragonName,
@@ -40,9 +43,11 @@ import type {
   WindName,
   WinContext,
 } from "@ourjong/engine";
+import { WALL_STACKS_PER_SIDE } from "@ourjong/engine";
+import type { DiceRollResult } from "@ourjong/engine";
 import { playSound } from "../audio";
-import { DiceRoll, rollDice } from "./Dice";
-import type { DiceRollState } from "./Dice";
+import { DiceRoll } from "./Dice";
+import type { DiceAction, DiceFlowState } from "../diceFlow";
 import { TileView } from "./TileView";
 
 export interface GameTableProps {
@@ -59,6 +64,8 @@ export interface GameTableProps {
   mySeat?: SeatIndex;
   /** The coach's suggestions (local play only; the switch lives in the app's top bar). */
   coachOn?: boolean;
+  /** How strong the bots are: 1 Novice, 2 Intermediate, 3 Expert. Chosen in the app's menu and read live. */
+  botLevel?: BotLevel;
   /** Turn the opponents' concealed tiles face up (local play only; switch in the top bar). */
   peek?: boolean;
   /**
@@ -71,6 +78,16 @@ export interface GameTableProps {
    * between two people, so the hand on screen is not on show to whoever is looking.
    */
   concealMine?: boolean;
+  /**
+   * The opening dice roll (see diceFlow.ts). While `isDiceRolling` the game waits; when the dice
+   * settle the table shows the dealer pip, "East rolls an 8" and where the wall breaks. Leave it
+   * out and the table starts without a roll.
+   */
+  dice?: DiceFlowState;
+  /** Where the table reports DICE_SETTLED (and DICE_DISMISSED). */
+  onDiceAction?: (action: DiceAction) => void;
+  /** Keep the dice off the table for now (they are waiting behind a privacy screen). */
+  holdDice?: boolean;
   /** Quick-chat emoji floating over each seat, keyed by absolute seat. Change `id` to resend. */
   emojis?: Partial<Record<number, { id: number; emoji: string }>>;
   /** Called with the seat when its emoji's animation ends, so the app can clear it. */
@@ -96,12 +113,18 @@ const PASS_DELAY_MS = 350;
 const TOAST_MS = 1500;
 const SLIDE_MS = 200;
 
-// Bots without an explicit `difficulty` on their Player play at this level.
-const DEFAULT_BOT_DIFFICULTY: BotDifficulty = "medium";
-const COACH_DIFFICULTY: BotDifficulty = "medium";
+/**
+ * The Coach, as a whole: the blue "this is what I would do" rings and the warning that stops you
+ * before a dangerous discard. Set to false to play unguided; the Coach switch in the app's menu
+ * only does anything while this is true. (Never on online or shared-device tables.)
+ */
+const COACH_ENABLED = true;
+// How strong the Coach's advice is: 3 is the Expert, which reads the table for danger.
+const COACH_LEVEL: BotLevel = 3;
 
-const difficultyOf = (player: Player): BotDifficulty =>
-  player.difficulty ?? DEFAULT_BOT_DIFFICULTY;
+// The bots' level comes from the app's difficulty setting (see ../difficulty.ts); this is only the
+// fallback for a table that is rendered without one: 1 Novice, 2 Intermediate, 3 Expert.
+const DEFAULT_BOT_LEVEL: BotLevel = 1;
 
 // Mirrors the engine's claim priority so a bot never sends a claim that is still blocked.
 const CLAIM_PRIORITY: Record<ClaimKind, number> = { chow: 1, pung: 2, kong: 2, win: 3 };
@@ -638,7 +661,7 @@ function claimLabel(claim: ClaimOption, discard: Tile): string {
     case "win":
       return "Hu";
     case "pung":
-      return "Pung";
+      return "Pong";
     case "kong":
       return "Kong";
     case "chow": {
@@ -650,7 +673,12 @@ function claimLabel(claim: ClaimOption, discard: Tile): string {
   }
 }
 
-const BUTTON_VARIANT: Record<ClaimKind, "win" | "pong" | "chow" | "kong"> = {
+/** The corner shape of a tile (TileView's own value), for anything that wraps a tile. */
+const TILE_RADIUS = "14% / 11%";
+/** The same corner on a tile turned a quarter turn, as in the side rivers. */
+const TILE_RADIUS_SIDEWAYS = "11% / 14%";
+
+const BUTTON_VARIANT: Record<ClaimKind, Exclude<ActionVariant, "pass" | "next">> = {
   win: "win",
   pung: "pong",
   chow: "chow",
@@ -762,7 +790,7 @@ function phaseMessage(state: GameState, hasClaims: boolean, mySeat: SeatIndex): 
     case "claim-window":
       if (phase.isRobbingKong) {
         return phase.discardedBy === mySeat
-          ? "You are adding to a pung. Waiting to see if anyone robs the kong…"
+          ? "You are adding to a pong. Waiting to see if anyone robs the kong…"
           : hasClaims
             ? `${who(phase.discardedBy)} is adding a kong. Win to rob it, or pass.`
             : `${who(phase.discardedBy)} is adding a kong…`;
@@ -889,12 +917,219 @@ function HandTile({
       data-fidget=""
       className={active ? "ourjong-hand-tile ourjong-coach" : "ourjong-hand-tile"}
       style={{
-        ...(active ? styles.coachRing : styles.coachSlot),
+        ...styles.coachSlot,
         ...(drawn ? styles.drawnGap : null),
       }}
     >
       {children}
     </div>
+  );
+}
+
+/* ---------- Action buttons: one shape for all of them ---------- */
+
+type ActionVariant = "win" | "pong" | "chow" | "kong" | "pass" | "next";
+
+/**
+ * Every button on the action bar (Chow, Pong, Kong, Hu and Skip) is this one component, so they
+ * share one class and therefore one height, padding and corner radius. Only the colours differ.
+ * `coach` adds the blue "this is what the coach would do" ring, which follows the button's own
+ * rounded corners.
+ */
+/**
+ * Every end-of-hand card: one scrim, one glass panel, one rhythm (head, body, note, button).
+ * The button is the shared ActionButton, so it has the same height and corner as the table's.
+ */
+function ResultCard({
+  label,
+  glyph,
+  title,
+  subtitle,
+  note,
+  actionLabel,
+  onAction,
+  secondaryLabel,
+  onSecondary,
+  className,
+  children,
+}: {
+  label: string;
+  glyph?: string;
+  title: string;
+  subtitle?: string;
+  note?: string;
+  actionLabel: string;
+  onAction: () => void;
+  /** A second, quieter button to the left of the main one (the Coach's "Discard Anyway"). */
+  secondaryLabel?: string;
+  onSecondary?: () => void;
+  /** Extra class on the panel, for a card that needs its own spacing. */
+  className?: string;
+  children?: ReactNode;
+}) {
+  const scrim = useRef<HTMLDivElement | null>(null);
+  const fit = useRef<HTMLDivElement | null>(null);
+  const panel = useRef<HTMLDivElement | null>(null);
+  useFitToScreen(scrim, fit, panel);
+  return (
+    <div ref={scrim} className="ourjong-scrim" role="dialog" aria-modal="true" aria-label={label}>
+      <div ref={fit} className="ourjong-fit">
+      <div ref={panel} className={`ourjong-panel ourjong-glass${className ? ` ${className}` : ""}`}>
+        <div className="ourjong-panel-head">
+          {glyph && (
+            <div className="ourjong-panel-glyph" aria-hidden="true">
+              {glyph}
+            </div>
+          )}
+          <h2 className="ourjong-panel-title">{title}</h2>
+          {subtitle && <p className="ourjong-panel-sub">{subtitle}</p>}
+        </div>
+        {children}
+        <div className="ourjong-panel-foot">
+          {note && <p className="ourjong-panel-note">{note}</p>}
+          <div className="ourjong-panel-actions">
+            {secondaryLabel && onSecondary && (
+              <ActionButton variant="pass" onClick={onSecondary}>
+                {secondaryLabel}
+              </ActionButton>
+            )}
+            <ActionButton variant="next" onClick={onAction}>
+              {actionLabel}
+            </ActionButton>
+          </div>
+        </div>
+      </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * No pop-up ever scrolls. The card wraps and shrinks first (see the CSS); if its content is still
+ * taller or wider than the screen allows (a long winning hand on a short phone), this shrinks the
+ * whole card just enough to fit. It measures the card's own layout size, which a scale does not
+ * change, so there is no feedback loop.
+ */
+function useFitToScreen(
+  scrim: { current: HTMLElement | null },
+  fit: { current: HTMLElement | null },
+  panel: { current: HTMLElement | null },
+) {
+  useLayoutEffect(() => {
+    const outer = scrim.current;
+    const wrap = fit.current;
+    const card = panel.current;
+    if (!outer || !wrap || !card) return undefined;
+    const apply = () => {
+      const style = getComputedStyle(outer);
+      const availH = outer.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+      const availW = outer.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const byHeight = card.offsetHeight > 0 ? availH / card.offsetHeight : 1;
+      const byWidth = Math.min(
+        card.scrollWidth > card.clientWidth + 1 ? card.clientWidth / card.scrollWidth : 1,
+        card.offsetWidth > 0 ? availW / card.offsetWidth : 1,
+      );
+      const k = Math.max(0.5, Math.min(1, byHeight, byWidth));
+      wrap.style.setProperty("--oj-fit", k.toFixed(3));
+    };
+    apply();
+    const watch = new ResizeObserver(apply);
+    watch.observe(outer);
+    watch.observe(card);
+    return () => watch.disconnect();
+  }, [scrim, fit, panel]);
+}
+
+/** A risk reading, 0-100, as a small bar and a number. Green is safe, amber is careful, red is dangerous. */
+function RiskMeter({ value }: { value: number }) {
+  const colour = value >= 75 ? "#ff7a59" : value >= 40 ? "#ffd978" : "#7ee2a1";
+  return (
+    <div className="ourjong-risk" style={{ ["--risk" as string]: colour }} aria-label={`Risk ${value} out of 100`}>
+      <div className="ourjong-risk-track">
+        <div className="ourjong-risk-fill" style={{ width: `${Math.max(4, value)}%` }} />
+      </div>
+      <span className="ourjong-risk-num">{value}</span>
+    </div>
+  );
+}
+
+/**
+ * The Coach's stop sign: the same glass card as the hand results, with the reasons, your tile
+ * next to the one the Coach would throw, and two choices. Cancel is the main button (it is what the
+ * Coach wants); Escape does the same.
+ */
+function CoachWarning({
+  advice,
+  tile,
+  best,
+  onDiscardAnyway,
+  onCancel,
+}: {
+  advice: DiscardAdvice;
+  tile: Tile;
+  best: Tile;
+  onDiscardAnyway: () => void;
+  onCancel: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  return (
+    <ResultCard
+      label="Coach warning"
+      className="ourjong-panel-coach"
+      glyph="危"
+      title={advice.title}
+      subtitle={advice.reason}
+      note={`The Coach would throw ${advice.bestName}.`}
+      actionLabel="Cancel"
+      onAction={onCancel}
+      secondaryLabel="Discard Anyway"
+      onSecondary={onDiscardAnyway}
+    >
+      <div className="ourjong-coach-compare">
+        <div className="ourjong-coach-side">
+          <span className="ourjong-coach-caption">Your tile</span>
+          <TileView tile={tile} />
+          <RiskMeter value={advice.danger} />
+        </div>
+        <span className="ourjong-coach-arrow" aria-hidden="true">
+          →
+        </span>
+        <div className="ourjong-coach-side">
+          <span className="ourjong-coach-caption">Coach</span>
+          <TileView tile={best} />
+          <RiskMeter value={advice.bestDanger} />
+        </div>
+      </div>
+    </ResultCard>
+  );
+}
+
+function ActionButton({
+  variant,
+  coach = false,
+  onClick,
+  children,
+}: {
+  variant: ActionVariant;
+  coach?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`ourjong-btn ourjong-btn-${variant}${coach ? " ourjong-btn-coach" : ""}`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -1041,6 +1276,230 @@ const COMPASS_EDGES: readonly { offset: number; style: CSSProperties; score: CSS
   },
 ];
 
+/* ---------- The roll's outcome: a line of text, and the wall with its break ---------- */
+
+const ROLL_NOTE_MS = 3600;
+const ANNOUNCED = new WeakSet<DiceRollResult>();
+
+/** "an 8" and "an 11", but "a 7". */
+const withArticle = (n: number): string => (n === 8 || n === 11 ? `an ${n}` : `a ${n}`);
+
+/**
+ * "East rolls an 8", shown in the hub for a few seconds, starting the moment the dice settle
+ * (and never before). Null the rest of the time.
+ */
+function useRollNote(state: GameState, settled: DiceRollResult | null): string | null {
+  const [shownFor, setShownFor] = useState<DiceRollResult | null>(null);
+  const [done, setDone] = useState(true);
+  useEffect(() => {
+    // Announced once per roll: coming back to the table later does not say it again.
+    if (settled === null || settled === shownFor || ANNOUNCED.has(settled)) return undefined;
+    ANNOUNCED.add(settled);
+    setShownFor(settled);
+    setDone(false);
+    const id = setTimeout(() => setDone(true), ROLL_NOTE_MS);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settled]);
+  if (settled === null || done || settled !== shownFor) return null;
+  const roller = WIND_NAMES[state.players[settled.rollerSeat].seatWind];
+  const target = WIND_NAMES[state.players[settled.breakerSeat].seatWind];
+  return `${roller} rolls ${withArticle(settled.total)} • Breaking ${target}\u2019s Wall`;
+}
+
+/*
+ * The wall, seen from above: four walls of 17 stacks, one in front of each player, with a small
+ * gap at each corner. Each wall is centred on its player's wind in the hub, so the four groups
+ * line up with the four seats. Stacks are drawn as little top-down tiles.
+ */
+const WALL_GAP_DEG = 8; // empty space at each corner
+const WALL_SPAN_DEG = 90 - WALL_GAP_DEG;
+const WALL_PITCH_DEG = WALL_SPAN_DEG / WALL_STACKS_PER_SIDE;
+const WALL_R = 45.2; // middle of the stacks, in a 100 x 100 hub
+const STACK_DEPTH = 4.2; // across the wall (in toward the middle of the hub)
+const STACK_WIDTH = 3.1; // along the wall
+const BREAK_OPEN_DEG = 1.6; // how far the wall parts at the break
+
+interface StackSpot {
+  /** Where it sits around the hub, in degrees (0 = right, 90 = down). */
+  deg: number;
+  /** 0 to 67, clockwise round the table starting at your own wall's right-hand end. */
+  pos: number;
+  index: number;
+}
+
+/**
+ * Every stack's place on screen. Within a wall, stacks are counted from the right-hand end as the
+ * person sitting there sees it (which runs clockwise on screen); the engine's `breakIndex` uses
+ * the same count, so it lands on the same stack.
+ */
+function wallSpots(mySeat: SeatIndex): StackSpot[] {
+  const spots: StackSpot[] = [];
+  for (let index = 0; index < WALL_STACKS_PER_SIDE * 4; index++) {
+    const seat = Math.floor(index / WALL_STACKS_PER_SIDE);
+    const stack = index % WALL_STACKS_PER_SIDE;
+    const side = (seat - mySeat + 4) % 4; // 0 bottom, 1 right, 2 top, 3 left
+    const centre = 90 - 90 * side;
+    spots.push({
+      index,
+      deg: centre - WALL_SPAN_DEG / 2 + (stack + 0.5) * WALL_PITCH_DEG,
+      // Walking clockwise from the bottom wall you meet the left wall, then the top, then the right.
+      pos: ((4 - side) % 4) * WALL_STACKS_PER_SIDE + stack,
+    });
+  }
+  return spots;
+}
+
+const wallTransform = (deg: number) => `rotate(${deg.toFixed(2)}) translate(${WALL_R} 0)`;
+
+/** Where the wall opens, as a position round the ring (same count as StackSpot.pos). */
+const breakPosOf = (roll: DiceRollResult, mySeat: SeatIndex): number =>
+  wallSpots(mySeat).find((s) => s.index === roll.breakIndex)!.pos;
+
+/** How thick a stack is once only its bottom tile is left (of a full stack's depth). */
+const HALF_STACK = 0.5;
+
+/** Two tiles to a stack. */
+const TILES_PER_STACK = 2;
+/** The deal: four hands of 13, taken from the wall as soon as it is broken. */
+const DEALT_TILES = 52;
+const DEAL_REVEAL_MS = 1000;
+const DEAL_WAVE_MS = 1600;
+const DEAL_SHOWN = new WeakSet<DiceRollResult>();
+
+/**
+ * The deal is already in the engine's state by the time the wall appears, so the table shows the
+ * wall whole for a beat after the dice settle and then clears the stacks the hands were dealt from,
+ * one after another. `wave` is true while that is happening (it staggers the fade). Coming back to
+ * the table later shows the wall as it is, with no replay.
+ */
+function useDealReveal(settled: DiceRollResult | null): { dealt: boolean; wave: boolean } {
+  const [, redraw] = useState(0);
+  const [wave, setWave] = useState(false);
+  useEffect(() => {
+    if (settled === null || DEAL_SHOWN.has(settled)) return undefined;
+    const reveal = setTimeout(() => {
+      DEAL_SHOWN.add(settled);
+      setWave(true);
+      redraw((n) => n + 1);
+    }, DEAL_REVEAL_MS);
+    const done = setTimeout(() => setWave(false), DEAL_REVEAL_MS + DEAL_WAVE_MS);
+    return () => {
+      clearTimeout(reveal);
+      clearTimeout(done);
+    };
+  }, [settled]);
+  return { dealt: settled !== null && DEAL_SHOWN.has(settled), wave };
+}
+
+/**
+ * The four walls, once the dice have settled, shrinking as the hand is played.
+ *
+ * Tiles leave the wall in two places, and the ring follows both:
+ *  - From the break, in order: first the deal, then each draw. Those stacks fade out, so a gap
+ *    grows along the ring away from the gold marker. The next tile to be drawn pulses.
+ *  - From the far end, beside the break: kong replacements come from the back of the dead wall.
+ *    The dead wall stays 16 tiles (the engine moves a live tile in to top it up), so the ghosted
+ *    stretch slides one tile toward the draw as replacements are taken, and is never drawn from.
+ *
+ * Positions are in tiles counted from the break, 0 to 135; a stack is two of them.
+ */
+function WallRing({
+  roll,
+  mySeat,
+  wall,
+  dealt,
+  wave,
+}: {
+  roll: DiceRollResult;
+  mySeat: SeatIndex;
+  wall: GameState["wall"];
+  dealt: boolean;
+  wave: boolean;
+}) {
+  const stacks = WALL_STACKS_PER_SIDE * 4;
+  const tiles = stacks * TILES_PER_STACK;
+  const breakPos = breakPosOf(roll, mySeat);
+
+  const fromBack = wall.deadDrawCount; // tiles taken from the far end
+  const fromFront = tiles - wall.deadWallSize - fromBack - wall.liveTiles.length; // deal + draws
+  const gone = dealt ? fromFront : Math.max(0, fromFront - DEALT_TILES);
+  const deadStart = tiles - fromBack - wall.deadWallSize; // first tile of the dead wall
+  const head = gone < deadStart ? gone : -1; // the next tile to be drawn, if any are left
+
+  return (
+    <svg className="ourjong-wall-ring" viewBox="-50 -50 100 100" style={styles.wallRing} aria-hidden="true">
+      {wallSpots(mySeat).map((spot) => {
+        if (spot.index === roll.breakIndex) return null; // drawn on top, see WallBreakMark
+        const ahead = (spot.pos - breakPos + stacks) % stacks; // 0 is the stack at the break
+        // The wall parts at the break: stacks just after it slide on, stacks just before slide back.
+        const part =
+          ahead < stacks / 2 ? BREAK_OPEN_DEG * Math.exp(-ahead / 5) : -BREAK_OPEN_DEG * Math.exp(-(stacks - ahead) / 5);
+
+        const first = ahead * TILES_PER_STACK;
+        const second = first + 1;
+        const left = (tile: number) => (tile >= gone && tile < tiles - fromBack ? 1 : 0);
+        const remaining = left(first) + left(second);
+        const dead = second >= deadStart;
+        const isHead = head >= 0 && Math.floor(head / TILES_PER_STACK) === ahead;
+
+        const className = [
+          "ourjong-wall-stack",
+          remaining === 1 ? "ourjong-wall-half" : "",
+          dead ? "ourjong-wall-dead" : "",
+          isHead ? "ourjong-wall-head" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        return (
+          <rect
+            key={spot.index}
+            className={className}
+            x={-STACK_DEPTH / 2}
+            y={-STACK_WIDTH / 2}
+            width={STACK_DEPTH}
+            height={STACK_WIDTH}
+            rx={0.7}
+            transform={wallTransform(spot.deg + part)}
+            // Two tiles: the full stack. One left: the stack is physically half as thick (and drawn
+            // as a lighter, outlined slab), so "bottom tile only" reads without relying on opacity.
+            // None: gone. The width change and the fade are the "disappearing".
+            style={{
+              ...(remaining === 1
+                ? { width: STACK_DEPTH * HALF_STACK, x: (-STACK_DEPTH * HALF_STACK) / 2 }
+                : null),
+              opacity: remaining === 0 ? 0 : 1,
+              transitionDelay: wave ? `${ahead * 22}ms` : "0ms",
+            }}
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
+/**
+ * The stack where the wall opens, in gold and a little longer than the rest. It is drawn above
+ * the wind discs, which cover the middle of each wall, so it can always be seen.
+ */
+function WallBreakMark({ roll, mySeat }: { roll: DiceRollResult; mySeat: SeatIndex }) {
+  const spot = wallSpots(mySeat).find((s) => s.index === roll.breakIndex)!;
+  const open = BREAK_OPEN_DEG; // it is the first live stack, so it sits on the far side of the gap
+  return (
+    <svg className="ourjong-wall-break-layer" viewBox="-50 -50 100 100" style={styles.wallRing} aria-hidden="true">
+      <rect
+        className="ourjong-wall-break"
+        x={-(STACK_DEPTH + 2) / 2}
+        y={-(STACK_WIDTH + 0.6) / 2}
+        width={STACK_DEPTH + 2}
+        height={STACK_WIDTH + 0.6}
+        rx={0.9}
+        transform={wallTransform(spot.deg + open)}
+      />
+    </svg>
+  );
+}
+
 /**
  * The hub of the table. It shows the round wind and hand, the wall, and the clock when there is
  * one. Round the edge are the four seat winds, each on the side its player sits: the seat on
@@ -1052,18 +1511,25 @@ function Compass({
   activeSeat,
   timer,
   clockOffsetMs,
-  roll,
-  onRollDone,
+  dice,
+  onDiceAction,
+  holdDice,
 }: {
   state: GameState;
   mySeat: SeatIndex;
   activeSeat: SeatIndex | undefined;
   timer: TimerConfig | null;
   clockOffsetMs: number;
-  roll: DiceRollState | null;
-  onRollDone: () => void;
+  dice: DiceFlowState | undefined;
+  onDiceAction: ((action: DiceAction) => void) | undefined;
+  holdDice: boolean;
 }) {
   const status = matchStatus(state);
+  // Nothing about the roll's outcome shows until the dice have stopped.
+  const settled = dice?.settled ?? null;
+  const outcomeKnown = dice === undefined || settled !== null;
+  const rollNote = useRollNote(state, settled);
+  const deal = useDealReveal(settled);
   const phase = state.phase;
   const deciding =
     phase.type === "claim-window"
@@ -1072,6 +1538,7 @@ function Compass({
 
   return (
     <div style={styles.compass} role="group" aria-label="Table compass">
+      {settled && <WallRing roll={settled} mySeat={mySeat} wall={state.wall} dealt={deal.dealt} wave={deal.wave} />}
       {COMPASS_EDGES.map(({ offset, style, score: scoreStyle }) => {
         const seat = ((mySeat + offset) % 4) as SeatIndex;
         const player = state.players[seat];
@@ -1090,7 +1557,7 @@ function Compass({
             title={`${windTag(player.seatWind)} · ${playerTag(player, mySeat)}${on ? " · on turn" : waiting ? " · deciding" : ""}`}
           >
             {WIND_GLYPHS[player.seatWind]}
-            {player.isDealer && (
+            {player.isDealer && outcomeKnown && (
               <span style={styles.compassDealer} title="Dealer" role="img" aria-label="Dealer">
                 莊
               </span>
@@ -1110,6 +1577,8 @@ function Compass({
         );
       })}
 
+      {settled && <WallBreakMark roll={settled} mySeat={mySeat} />}
+
       <div style={styles.compassCore}>
         <div style={styles.compassGlyph} aria-hidden="true">
           {WIND_GLYPHS[status.prevailingWind]}
@@ -1122,7 +1591,20 @@ function Compass({
         {timer && <TurnTimer key={timer.deadline} {...timer} offsetMs={clockOffsetMs} compact />}
       </div>
 
-      {roll && <DiceRoll roll={roll} onDone={onRollDone} />}
+      {rollNote && (
+        <div className="ourjong-roll-pill ourjong-glass" style={styles.rollPill} role="status" aria-live="polite">
+          {rollNote}
+        </div>
+      )}
+
+      {dice && onDiceAction && dice.visible && dice.diceTargets && dice.key !== null && !holdDice && (
+        <DiceRoll
+          key={dice.key}
+          targets={dice.diceTargets}
+          onRollComplete={() => onDiceAction({ type: "DICE_SETTLED", key: dice.key! })}
+          onDismiss={() => onDiceAction({ type: "DICE_DISMISSED", key: dice.key! })}
+        />
+      )}
     </div>
   );
 }
@@ -1304,11 +1786,15 @@ export function GameTable({
   notice = null,
   clockOffsetMs = 0,
   coachOn: coachRequested = false,
+  botLevel = DEFAULT_BOT_LEVEL,
   peek: peekRequested = false,
   emojis = {},
   onEmojiDone,
   humanSeats,
   concealMine = false,
+  dice,
+  onDiceAction,
+  holdDice = false,
 }: GameTableProps) {
   // Seats that are people. Everyone else is run by the AI below.
   const humans: readonly SeatIndex[] = humanSeats ?? [mySeat];
@@ -1317,22 +1803,15 @@ export function GameTable({
   // Online there is no coach (it would be an unfair aid) and no peek (the tiles are not here).
   // With several people on one device either would give their hands away.
   const shared = humans.length > 1;
-  const coachOn = coachRequested && !isMultiplayer && !shared;
+  const coachOn = COACH_ENABLED && coachRequested && !isMultiplayer && !shared;
   const peek = peekRequested && !isMultiplayer && !shared;
 
-  // The dice roll when a hand begins: when the table opens on a fresh deal, and each time the
-  // next hand is dealt. Reopening the table in the middle of a hand does not roll them again.
-  const rollKey = `${state.id}|${state.random?.seed ?? ""}|${state.round.handNumber}|${state.round.dealerRepeats}`;
-  const lastRollKey = useRef(rollKey);
-  const [roll, setRoll] = useState<DiceRollState | null>(() =>
-    state.phase.type === "setup" ? rollDice(rollKey) : null,
-  );
-  useEffect(() => {
-    if (lastRollKey.current === rollKey) return;
-    lastRollKey.current = rollKey;
-    setRoll(rollDice(rollKey));
-  }, [rollKey]);
+  // The opening roll is decided by the engine and played by <DiceRoll> (see diceFlow.ts). Until
+  // the dice settle, the game waits: nobody deals in, draws or discards.
+  const rolling = dice !== undefined && onDiceAction !== undefined && dice.isDiceRolling;
   const [toast, setToast] = useState<(ToastContent & { id: number }) | null>(null);
+  // A discard the Coach stopped, waiting for "Discard Anyway" or "Cancel".
+  const [coachStop, setCoachStop] = useState<{ tile: Tile; advice: DiscardAdvice } | null>(null);
   const seenActions = useRef(state.history.length);
   const me = state.players[mySeat];
   const phase = state.phase;
@@ -1503,29 +1982,31 @@ export function GameTable({
     return () => clearTimeout(id);
   }, [toast]);
 
-  /* ---------- Coach: what the medium AI would do for you ---------- */
+  /* ---------- Coach: what the Expert would do for you ---------- */
   const coachDiscardId =
-    coachOn && canDiscard && heldTiles.length > 0
-      ? getBestDiscard(heldTiles, me.melds, COACH_DIFFICULTY).id
-      : undefined;
+    coachOn && canDiscard && heldTiles.length > 0 ? recommendDiscard(state, mySeat)?.id : undefined;
 
-  const coachClaim: ClaimOption | "pass" | undefined =
-    coachOn && phase.type === "claim-window" && myClaims.length > 0
-      ? getBestClaim(
-        me.hand,
-        me.melds,
-        phase.tile,
-        myClaims,
-        COACH_DIFFICULTY,
-        Math.random,
-        winContextOf(state, mySeat),
-      )
-      : undefined;
+  // The Expert's call on the open discard, asked of the same bot controller that plays the bots.
+  const coachClaim: ClaimOption | "pass" | undefined = (() => {
+    if (!coachOn || phase.type !== "claim-window" || myClaims.length === 0) return undefined;
+    const action = getBotAction(state, mySeat, COACH_LEVEL);
+    if (action === null) return undefined;
+    if (action.type === "pass") return "pass";
+    if (action.type !== "claim") return undefined;
+    return myClaims.find((c) => c.kind === action.payload.kind) ?? "pass";
+  })();
+
+  // The turn moved on (or the tile is gone): a warning for a discard that can no longer happen goes.
+  useEffect(() => {
+    if (coachStop !== null && !canDiscard) setCoachStop(null);
+  }, [canDiscard, coachStop]);
 
   /* ---------- Automation: bots claim or pass, then play their turns ---------- */
   useEffect(() => {
     // Online, every seat is a person: the server runs the game and nothing is automated here.
     if (isMultiplayer) return undefined;
+    // The dice are still falling: nothing moves until they stop.
+    if (rolling) return undefined;
 
     const seq = state.history.length;
 
@@ -1539,140 +2020,25 @@ export function GameTable({
       return () => clearTimeout(id);
     }
 
-    // 1. Claim window: each bot with a claim asks the AI whether to take it.
-    if (phase.type === "claim-window") {
-      const decisions = [
-        ...new Set(
-          phase.availableClaims
-            .map((c) => c.seat)
-            .filter((s) => isBotSeat(s) && !phase.passed.includes(s)),
-        ),
-      ].map((seat) => {
-        const bot = state.players[seat];
-        const choice = getBestClaim(
-          bot.hand,
-          bot.melds,
-          phase.tile,
-          phase.availableClaims.filter((c) => c.seat === seat),
-          difficultyOf(bot),
-          Math.random,
-          winContextOf(state, seat),
-        );
-        return { seat, choice };
-      });
-
-      // A claim is only accepted once no higher-priority seat is still undecided
-      // (the human's buttons included), so send the strongest unblocked one first.
-      const isBlocked = (seat: SeatIndex, kind: ClaimKind) =>
-        phase.availableClaims.some(
-          (c) =>
-            c.seat !== seat &&
-            !phase.passed.includes(c.seat) &&
-            CLAIM_PRIORITY[c.kind] > CLAIM_PRIORITY[kind],
-        );
-
-      const claimNow = decisions
-        .flatMap((d) => (d.choice === "pass" ? [] : [{ seat: d.seat, option: d.choice }]))
-        .sort((a, b) => CLAIM_PRIORITY[b.option.kind] - CLAIM_PRIORITY[a.option.kind])
-        .find((c) => !isBlocked(c.seat, c.option.kind));
-      const passNow = decisions.find((d) => d.choice === "pass");
-
-      const action: GameAction | undefined = claimNow
-        ? {
-            type: "claim",
-            seq,
-            seat: claimNow.seat,
-            timestamp: Date.now(),
-            payload: { kind: claimNow.option.kind, usingTiles: claimNow.option.usingTiles },
-          }
-        : passNow
-          ? { type: "pass", seq, seat: passNow.seat, timestamp: Date.now() }
-          : undefined;
-
-      if (action === undefined) return undefined; // waiting on the human
-      const id = setTimeout(() => dispatch(action), PASS_DELAY_MS);
-      return () => clearTimeout(id);
-    }
-
-    // 2. Bot turns (seats 1-3): draw, then discard whatever the AI rates least useful.
-    if ((phase.type === "draw" || phase.type === "action") && isBotSeat(phase.seat)) {
-      const seat = phase.seat;
-
-      if (phase.type === "draw") {
-        const top = state.wall.liveTiles[0];
-        if (top === undefined) return undefined; // wall exhausted: nothing to do yet
-        // The engine ignores this tile and takes the real top of the wall.
-        const id = setTimeout(
-          () =>
-            dispatch({
-              type: "draw",
-              seq,
-              seat,
-              timestamp: Date.now(),
-              tile: top,
-              fromDeadWall: false,
-            }),
-          BOT_DELAY_MS,
-        );
-        return () => clearTimeout(id);
-      }
-
-      const player = state.players[seat];
-
-      // A bot never passes up a legal win: a drawn tile that completes a 3+ fan hand ends it.
-      if (
-        player.drawnTile !== null &&
-        shouldDeclareSelfDrawWin(
-          player.hand,
-          player.melds,
-          player.drawnTile,
-          winContextOf(state, seat),
-        )
-      ) {
-        const winningTile = player.drawnTile;
-        const id = setTimeout(
-          () =>
-            dispatch({
-              type: "win",
-              seq,
-              seat,
-              timestamp: Date.now(),
-              method: "self-draw",
-              winningTile,
-            }),
-          BOT_DELAY_MS,
-        );
-        return () => clearTimeout(id);
-      }
-
-      const candidates = player.drawnTile ? [...player.hand, player.drawnTile] : player.hand;
-      if (candidates.length === 0) return undefined;
-      const tile = getBestDiscard(candidates, player.melds, difficultyOf(player));
-      const id = setTimeout(
-        () =>
-          dispatch({
-            type: "discard",
-            seq,
-            seat,
-            timestamp: Date.now(),
-            tile,
-            fromDraw: player.drawnTile?.id === tile.id,
-          }),
-        BOT_DELAY_MS,
-      );
-      return () => clearTimeout(id);
-    }
-
-    return undefined;
-  }, [state, phase, dispatch, isMultiplayer, humansKey]);
+    // 1-2. Everything else a bot does (claim, pass, draw, win, discard) is one question put to the
+    // engine's bot controller: "what should the next automated seat do?" It returns a finished
+    // action, already ordered for claim priority, or null while a human has to move.
+    const action = nextBotAction(state, isBotSeat, () => botLevel, { timestamp: Date.now() });
+    if (action === null) return undefined;
+    const id = setTimeout(
+      () => dispatch(action),
+      phase.type === "claim-window" ? PASS_DELAY_MS : BOT_DELAY_MS,
+    );
+    return () => clearTimeout(id);
+  }, [state, phase, dispatch, isMultiplayer, humansKey, rolling, botLevel]);
 
   /* ---------- Auto-draw: your own draw (and the opening deal) happens by itself ---------- */
   useEffect(() => {
-    if (!canStart && !canDraw) return undefined;
+    if (rolling || (!canStart && !canDraw)) return undefined;
     const id = setTimeout(drawTile, HUMAN_DRAW_DELAY_MS);
     return () => clearTimeout(id);
     // drawTile is rebuilt every render from the same state, so [state] is the real dependency.
-  }, [state, canStart, canDraw]);
+  }, [state, canStart, canDraw, rolling]);
 
   /* ---------- Human actions ---------- */
   const drawTile = () => {
@@ -1696,7 +2062,21 @@ export function GameTable({
     }
   };
 
+  // Clicking a tile asks the Coach first. A tile it flags is held back (nothing is dispatched, the
+  // game waits on your answer); anything else goes straight out.
   const discardTile = (tile: Tile) => {
+    if (!canDiscard) return;
+    if (coachOn) {
+      const advice = adviseDiscard(state, mySeat, tile, (seat) => seatName(state, seat, mySeat));
+      if (advice.warn) {
+        setCoachStop({ tile, advice });
+        return;
+      }
+    }
+    sendDiscard(tile);
+  };
+
+  const sendDiscard = (tile: Tile) => {
     if (!canDiscard) return;
     playSound("discard");
     dispatch({
@@ -1737,7 +2117,7 @@ export function GameTable({
     (win ? patternLabels(win.result) : []);
   const nextHandLabel = match.matchEndsNext ? "Finish Match" : "Next Hand";
 
-  // Concealed kong: all four tiles. Added kong: the single fourth tile for an open pung.
+  // Concealed kong: all four tiles. Added kong: the single fourth tile for an open pong.
   const declareConcealedKong = (tiles: Tile[]) => {
     playSound("claim");
     dispatch({
@@ -1975,8 +2355,9 @@ export function GameTable({
                     activeSeat={activeSeat}
                     timer={timer}
                     clockOffsetMs={clockOffsetMs}
-                    roll={roll}
-                    onRollDone={() => setRoll(null)}
+                    dice={dice}
+                    onDiceAction={onDiceAction}
+                    holdDice={holdDice}
                   />
                 </div>
               </div>
@@ -2006,58 +2387,38 @@ export function GameTable({
               {(claimPending || canWinNow || hiddenKongs.length > 0 || promotedKongs.length > 0) && (
               <div style={styles.actionBar} aria-label="Actions">
                 {canWinNow && (
-                  <button
-                    type="button"
-                    onClick={declareSelfDrawWin}
-                    className="ourjong-btn ourjong-btn-win"
-                  >
+                  <ActionButton variant="win" onClick={declareSelfDrawWin}>
                     Hu
-                  </button>
+                  </ActionButton>
                 )}
                 {phase.type === "claim-window" &&
                   myClaims.map((option, i) => {
                     const recommended = coachClaim === option;
                     return (
-                      <button
+                      <ActionButton
                         key={`claim-${i}`}
-                        type="button"
+                        variant={BUTTON_VARIANT[option.kind]}
+                        coach={recommended}
                         onClick={() => claim(option)}
-                        className={`ourjong-btn ourjong-btn-${BUTTON_VARIANT[option.kind]}${recommended ? " ourjong-coach" : ""}`}
-                        style={recommended ? styles.coachRing : undefined}
                       >
                         {claimLabel(option, phase.tile)}
-                      </button>
+                      </ActionButton>
                     );
                   })}
                 {hiddenKongs.map((tiles, i) => (
-                  <button
-                    key={`hidden-${i}`}
-                    type="button"
-                    onClick={() => declareConcealedKong(tiles)}
-                    className="ourjong-btn ourjong-btn-kong"
-                  >
+                  <ActionButton key={`hidden-${i}`} variant="kong" onClick={() => declareConcealedKong(tiles)}>
                     Kong
-                  </button>
+                  </ActionButton>
                 ))}
                 {promotedKongs.map((option) => (
-                  <button
-                    key={`added-${option.tile.id}`}
-                    type="button"
-                    onClick={() => declareAddedKong(option.tile)}
-                    className="ourjong-btn ourjong-btn-kong"
-                  >
+                  <ActionButton key={`added-${option.tile.id}`} variant="kong" onClick={() => declareAddedKong(option.tile)}>
                     Kong
-                  </button>
+                  </ActionButton>
                 ))}
                 {claimPending && (
-                  <button
-                    type="button"
-                    onClick={passClaim}
-                    className={`ourjong-btn ourjong-btn-pass${coachClaim === "pass" ? " ourjong-coach" : ""}`}
-                    style={coachClaim === "pass" ? styles.coachRing : undefined}
-                  >
+                  <ActionButton variant="pass" coach={coachClaim === "pass"} onClick={passClaim}>
                     Skip
-                  </button>
+                  </ActionButton>
                 )}
               </div>
               )}
@@ -2120,84 +2481,76 @@ export function GameTable({
 
       </div>
 
+      {coachStop !== null && canDiscard && (
+        <CoachWarning
+          advice={coachStop.advice}
+          tile={coachStop.tile}
+          best={coachStop.advice.best}
+          onDiscardAnyway={() => {
+            const { tile } = coachStop;
+            setCoachStop(null);
+            sendDiscard(tile);
+          }}
+          onCancel={() => setCoachStop(null)}
+        />
+      )}
+
       {drawGame && (
-        <div style={styles.overlay} role="dialog" aria-modal="true" aria-label="Hand result">
-          <div style={styles.scoreCard}>
-            <div style={styles.drawGlyph} aria-hidden="true">
-              流局
-            </div>
-            <h2 style={styles.scoreTitle}>Draw Game - No Tiles Remaining</h2>
-            <p style={styles.cardMuted}>Nobody won this hand. No points change hands.</p>
-            <p style={styles.cardNote}>
-              {matchTitle(match)} · {nextHandNote(state, match, mySeat)}
-            </p>
-            <button type="button" onClick={nextHand} style={styles.actionButton}>
-              {nextHandLabel}
-            </button>
-          </div>
-        </div>
+        <ResultCard
+          label="Hand result"
+          glyph="流局"
+          title="No Winner"
+          subtitle="The wall ran out. No points change hands."
+          note={`${matchTitle(match)} · ${nextHandNote(state, match, mySeat)}`}
+          actionLabel={nextHandLabel}
+          onAction={nextHand}
+        />
       )}
 
       {matchOver && (
-        <div style={styles.overlay} role="dialog" aria-modal="true" aria-label="Match result">
-          <div style={styles.scoreCard}>
-            <div style={styles.drawGlyph} aria-hidden="true">
-              終局
-            </div>
-            <h2 style={styles.scoreTitle}>Match Complete</h2>
-            <p style={styles.cardMuted}>
-              {match.totalRounds === 1
-                ? "The East round is finished."
-                : `All ${match.totalRounds} rounds are finished.`}
-            </p>
-            <Leaderboard state={state} mySeat={mySeat} />
-            <button type="button" onClick={nextHand} style={styles.actionButton}>
-              New Match
-            </button>
-          </div>
-        </div>
+        <ResultCard
+          label="Match result"
+          glyph="終局"
+          title="Match Complete"
+          subtitle={
+            match.totalRounds === 1
+              ? "The East round is finished."
+              : `All ${match.totalRounds} rounds are finished.`
+          }
+          actionLabel="New Match"
+          onAction={nextHand}
+        >
+          <Leaderboard state={state} mySeat={mySeat} />
+        </ResultCard>
       )}
 
       {win && (
-        <div style={styles.overlay} role="dialog" aria-modal="true" aria-label="Hand result">
-          <div style={styles.scoreCard}>
-            <h2 style={styles.scoreTitle}>
-              {win.seat === mySeat
-                ? "You win!"
-                : `${playerTag(state.players[win.seat], mySeat)} wins`}
-            </h2>
-            <p style={styles.muted}>
-              {windTag(state.players[win.seat].seatWind)}
-              {win.selfDrawn ? " · self-drawn" : ""}
-            </p>
-            <div style={styles.scoreHand} aria-label="Winning hand">
-              {win.melds.map((meld, i) => (
-                <div key={`meld-${i}`} style={styles.meld}>
-                  {meld.tiles.map((tile) => (
-                    <TileView key={tile.id} tile={tile} />
-                  ))}
-                </div>
-              ))}
-              <div style={styles.meld}>
-                {win.hand.map((tile) => (
+        <ResultCard
+          label="Hand result"
+          title={win.seat === mySeat ? "You win!" : `${playerTag(state.players[win.seat], mySeat)} wins`}
+          subtitle={`${windTag(state.players[win.seat].seatWind)}${win.selfDrawn ? " · self-drawn" : ""}`}
+          note={`${matchTitle(match)} · ${nextHandNote(state, match, mySeat)}`}
+          actionLabel={nextHandLabel}
+          onAction={nextHand}
+        >
+          <div className="ourjong-score-hand" style={styles.scoreHand} aria-label="Winning hand">
+            {win.melds.map((meld, i) => (
+              <div key={`meld-${i}`} style={styles.meld}>
+                {meld.tiles.map((tile) => (
                   <TileView key={tile.id} tile={tile} />
                 ))}
-                <TileView tile={win.tile} isDrawn />
               </div>
+            ))}
+            <div style={styles.meld}>
+              {win.hand.map((tile) => (
+                <TileView key={tile.id} tile={tile} />
+              ))}
+              <TileView tile={win.tile} isDrawn />
             </div>
-
-            <FanSummary totalFan={totalFan} patterns={patternLines} selfDrawn={win.selfDrawn} />
-
-            <PaymentList payments={payments} state={state} mySeat={mySeat} />
-
-            <p style={styles.cardNote}>
-              {matchTitle(match)} · {nextHandNote(state, match, mySeat)}
-            </p>
-            <button type="button" onClick={nextHand} style={styles.actionButton}>
-              {nextHandLabel}
-            </button>
           </div>
-        </div>
+          <FanSummary totalFan={totalFan} patterns={patternLines} selfDrawn={win.selfDrawn} />
+          <PaymentList payments={payments} state={state} mySeat={mySeat} />
+        </ResultCard>
       )}
     </div>
   );
@@ -2229,6 +2582,115 @@ const TABLE_CSS = `
   grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
 }
+/* ---------- One overlay language: notices, the roll pill and the result cards ----------
+   Dark glass, one blur, one hairline, two radii (panel, and the smaller one that matches the
+   action buttons), one padding unit. Everything that floats over the table uses these. */
+.ourjong-glass {
+  --oj-radius: 20px;
+  --oj-radius-sm: max(14px, calc(var(--t, 44px) * 0.42));
+  --oj-pad: 20px;
+  --oj-gap: 12px;
+  --oj-glass: rgba(10, 28, 22, 0.78);
+  --oj-line: rgba(255, 255, 255, 0.14);
+  --oj-ink: #f4efe0;
+  --oj-ink-dim: rgba(244, 239, 224, 0.68);
+  --oj-gold: #ffd978;
+  -webkit-backdrop-filter: blur(14px) saturate(1.1);
+  backdrop-filter: blur(14px) saturate(1.1);
+  background: var(--oj-glass);
+  border: 1px solid var(--oj-line);
+  color: var(--oj-ink);
+  box-shadow: 0 14px 36px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+.ourjong-scrim {
+  position: fixed; inset: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: center;
+  padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  box-sizing: border-box;
+  overflow: hidden; overflow: clip; /* a pop-up never scrolls, in either direction (clip cannot even scroll by script) */
+  container: ojscrim / inline-size; /* the card sizes its contents to the screen (cqi, @container) */
+  background: rgba(3, 10, 8, 0.55);
+  -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+  animation: ourjong-scrim-in 220ms ease-out both;
+}
+/* Shrinks the whole card, only when wrapping was not enough (see useFitToScreen). */
+.ourjong-fit {
+  --oj-fit: 1;
+  display: flex; justify-content: center; align-items: center;
+  width: 100%; min-width: 0; max-width: 100%;
+  transform: scale(var(--oj-fit)); transform-origin: center;
+}
+.ourjong-panel {
+  width: 100%; max-width: min(420px, 100%); min-width: 0; box-sizing: border-box;
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  gap: var(--oj-gap);
+  padding: var(--oj-pad);
+  border-radius: var(--oj-radius);
+  overflow: hidden; overflow-wrap: anywhere;
+  animation: ourjong-panel-in 260ms cubic-bezier(0.2, 0.9, 0.3, 1.1) both;
+}
+/* Nothing inside may be wider than the card; long things wrap instead of pushing it out. */
+.ourjong-panel > *, .ourjong-panel-head, .ourjong-panel-foot { min-width: 0; max-width: 100%; }
+.ourjong-score-hand > div { flex-wrap: wrap; justify-content: center; max-width: 100%; }
+/* The head of a card: glyph, title and subtitle share one centred stack with fixed rhythm. */
+.ourjong-panel-head { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
+.ourjong-panel-glyph { font-family: "Noto Serif TC","Noto Serif CJK TC","PingFang TC","Hiragino Mincho ProN",serif; font-size: 2.6rem; font-weight: 900; line-height: 1; letter-spacing: 0; padding-left: 0; color: var(--oj-gold); margin-bottom: 4px; text-shadow: 0 2px 10px rgba(255,200,80,0.25); }
+.ourjong-panel-title { margin: 0; font-size: 1.3rem; font-weight: 800; line-height: 1.2; letter-spacing: 0.01em; text-wrap: balance; }
+.ourjong-panel-sub { margin: 0; font-size: 0.95rem; line-height: 1.4; color: var(--oj-ink-dim); text-wrap: balance; }
+.ourjong-panel-note { margin: 0; font-size: 0.85rem; line-height: 1.4; font-weight: 600; letter-spacing: 0.02em; color: var(--oj-ink-dim); text-wrap: balance; }
+.ourjong-panel-rule { width: 100%; height: 1px; border: 0; margin: 0; background: var(--oj-line); }
+.ourjong-panel-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; width: 100%; min-width: 0; }
+.ourjong-panel-actions > * { min-width: 0; max-width: 100%; }
+/* The Coach warning: one sentence, then your tile beside the Coach's. */
+.ourjong-coach-compare { --tile-width: clamp(34px, 9vw, 46px); display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; width: 100%; }
+.ourjong-coach-side { display: flex; flex-direction: column; align-items: center; gap: 8px; min-width: 0; }
+.ourjong-coach-caption { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--oj-ink-dim); }
+.ourjong-coach-arrow { font-size: 1.4rem; color: var(--oj-ink-dim); }
+.ourjong-risk { width: 100%; max-width: 116px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.ourjong-risk-track { width: 100%; height: 6px; border-radius: 3px; background: rgba(255,255,255,0.12); overflow: hidden; }
+.ourjong-risk-fill { height: 100%; border-radius: inherit; background: var(--risk); }
+.ourjong-risk-num { font-size: 0.9rem; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--risk); }
+.ourjong-panel-foot { display: flex; flex-direction: column; align-items: center; gap: 10px; width: 100%; padding-top: 4px; }
+@keyframes ourjong-scrim-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ourjong-panel-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .ourjong-scrim, .ourjong-panel { animation: none; } }
+/* Narrow screens: tighter card, smaller type, buttons stacked full width instead of side by side. */
+@container ojscrim (max-width: 400px) {
+  .ourjong-glass { --oj-pad: 14px; --oj-gap: 10px; }
+  .ourjong-panel-title { font-size: 1.15rem; }
+  .ourjong-panel-sub { font-size: 0.88rem; }
+  .ourjong-panel-actions > * { flex: 1 1 100%; }
+}
+@media (max-height: 520px) {
+  .ourjong-glass { --oj-pad: 14px; --oj-gap: 8px; }
+  .ourjong-panel-glyph { font-size: 2rem; }
+  /* The Coach card has the most to say: on a short screen it drops the glyph and shrinks its tiles. */
+  .ourjong-panel-coach { max-width: min(520px, 100%); }
+  .ourjong-panel-coach .ourjong-panel-glyph { display: none; }
+  .ourjong-panel-coach .ourjong-coach-compare { --tile-width: 30px; gap: 6px; }
+  .ourjong-panel-coach .ourjong-coach-side { gap: 5px; }
+}
+.ourjong-wall-ring { animation: ourjong-wall-in 700ms ease-out both; }
+@keyframes ourjong-wall-in { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: none; } }
+/* A stack seen from above: a small ivory tile with a darker edge. */
+.ourjong-wall-stack { fill: rgba(244,239,224,0.62); stroke: rgba(0,0,0,0.35); stroke-width: 0.3; transition: opacity 500ms ease, width 400ms ease, x 400ms ease; }
+/* One tile left: half the thickness, a flatter fill and a crisp light edge, so it is a different
+   shape and not just a fainter one. */
+.ourjong-wall-half { fill: rgba(244,239,224,0.34); stroke: rgba(244,239,224,0.85); stroke-width: 0.35; }
+/* The next tile to be drawn: a soft pulse, so the eye can follow the wall as it is eaten. */
+.ourjong-wall-head { animation: ourjong-wall-head 1.3s ease-in-out infinite; }
+@keyframes ourjong-wall-head { 0%, 100% { fill: rgba(244,239,224,0.62); } 50% { fill: #fffdf4; } }
+.ourjong-wall-half.ourjong-wall-head { animation-name: ourjong-wall-head-half; }
+@keyframes ourjong-wall-head-half { 0%, 100% { fill: rgba(244,239,224,0.34); } 50% { fill: #fffdf4; } }
+/* The dead wall: the last stacks to be drawn, dimmed once the wall is broken. */
+.ourjong-wall-dead { animation: ourjong-wall-fade 900ms ease-out 500ms both; }
+@keyframes ourjong-wall-fade { to { fill: rgba(244,239,224,0.2); stroke: rgba(0,0,0,0.12); } }
+/* The break: the gold stack lights up, with a glow. */
+.ourjong-wall-break { fill: #ffd978; stroke: #fff3c4; stroke-width: 0.4; filter: drop-shadow(0 0 2px rgba(255,200,80,0.9)); animation: ourjong-wall-break 900ms ease-out 350ms both; transform-box: fill-box; transform-origin: center; }
+@keyframes ourjong-wall-break { 0% { opacity: 0; } 35% { opacity: 1; filter: drop-shadow(0 0 5px rgba(255,200,80,1)); } 100% { opacity: 1; } }
+.ourjong-roll-pill { animation: ourjong-pill-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1.2) both; }
+@keyframes ourjong-pill-in { from { opacity: 0; margin-top: -6px; } to { opacity: 1; margin-top: 0; } }
+@media (prefers-reduced-motion: reduce) { .ourjong-wall-ring, .ourjong-wall-dead, .ourjong-wall-head, .ourjong-wall-break, .ourjong-roll-pill { animation: none; } .ourjong-wall-dead { fill: rgba(244,239,224,0.2); } }
 .ourjong-emoji-float { animation: ourjong-emoji-rise 2.6s ease-out both; }
 @keyframes ourjong-emoji-rise {
   0%   { opacity: 0; transform: translate(var(--ex, -50%), 10px) scale(0.6); }
@@ -2299,11 +2761,16 @@ const TABLE_CSS = `
   justify-content: center;
   text-align: center;
   box-sizing: border-box;
-  min-height: max(44px, calc(var(--t, 44px) * 1.1));
+  /* The one shape every action button shares. Variants below change colour and nothing else. */
+  --btn-h: max(44px, calc(var(--t, 44px) * 1.1));
+  --btn-radius: max(14px, calc(var(--t, 44px) * 0.42));
+  height: var(--btn-h);
+  min-height: var(--btn-h);
   min-width: max(80px, calc(var(--t, 44px) * 2.4));
+  margin: 0;
   padding: 0 calc(var(--t, 44px) * 0.7);
   border: 1.5px solid rgba(255,255,255,0.6);
-  border-radius: max(14px, calc(var(--t, 44px) * 0.42));
+  border-radius: var(--btn-radius);
   font-family: "Inter", "SF Pro Display", "Segoe UI", "Helvetica Neue", Arial, system-ui, sans-serif;
   font-size: max(0.92rem, calc(var(--t, 44px) * 0.36));
   font-weight: 800;
@@ -2364,7 +2831,26 @@ const TABLE_CSS = `
   backdrop-filter: blur(6px);
   box-shadow: 0 4px 0 rgba(0,0,0,0.5), 0 0 12px 1px rgba(148,163,184,0.25), 0 10px 18px rgba(0,0,0,0.35);
 }
+/* Next Hand / New Match: the same shape as every other action button, in the table's gold. */
+.ourjong-btn-next {
+  background: linear-gradient(180deg, #ffe08a 0%, #f2b134 55%, #d98a12 100%);
+  border-color: #fff3c4;
+  color: #3a2600;
+  text-shadow: 0 1px 0 rgba(255,255,255,0.45);
+  box-shadow: 0 4px 0 #8a5a0b, 0 10px 18px rgba(0,0,0,0.4);
+}
 .ourjong-btn:active { box-shadow: 0 1px 0 rgba(0,0,0,0.5), 0 0 10px rgba(255,255,255,0.25); }
+/* Coach on a button: an outline, which follows the button's own rounded corners (a box-shadow
+   ring would also work, but would replace the button's raised look). */
+.ourjong-btn-coach {
+  outline: 3px solid #3b82f6;
+  outline-offset: 3px;
+  animation: ourjong-btn-in 220ms cubic-bezier(0.2, 0.9, 0.3, 1.2) both, ourjong-btn-coach-pulse 1.1s ease-in-out 220ms infinite;
+}
+@keyframes ourjong-btn-coach-pulse {
+  0%, 100% { outline-color: #3b82f6; outline-offset: 3px; }
+  50%      { outline-color: #93c5fd; outline-offset: 5px; }
+}
 
 @keyframes ourjong-btn-in {
   from { opacity: 0; transform: translateX(24px) scale(0.85); }
@@ -2408,9 +2894,11 @@ const TABLE_CSS = `
 
 /* Coach: pulsing blue ring (ring-4 ring-blue-500). */
 @keyframes ourjong-coach-pulse {
-  0%, 100% { box-shadow: 0 0 0 4px #3b82f6, 0 0 6px 4px rgba(59,130,246,0.35); }
-  50%      { box-shadow: 0 0 0 4px #60a5fa, 0 0 18px 8px rgba(59,130,246,0.8); }
+  0%, 100% { box-shadow: 0 0 0 var(--ring, 4px) #3b82f6, 0 0 6px var(--ring, 4px) rgba(59,130,246,0.35); }
+  50%      { box-shadow: 0 0 0 var(--ring, 4px) #60a5fa, 0 0 18px calc(var(--ring, 4px) * 2) rgba(59,130,246,0.8); }
 }
+/* A ring in proportion to the tile: thin on small tiles, never heavier than 4px. */
+.ourjong-hand-tile { --ring: clamp(2px, calc(var(--tile-width, 44px) * 0.08), 4px); }
 .ourjong-coach { animation: ourjong-coach-pulse 1.1s ease-in-out infinite; }
 
 /* River: the newest discard drops in, then pulses red and gold. */
@@ -2465,6 +2953,7 @@ const TABLE_CSS = `
   .ourjong-hand-tile { transition: none; }
   .ourjong-limit,
   .ourjong-coach,
+  .ourjong-btn-coach,
   .ourjong-last-discard,
   .ourjong-cutin,
   .ourjong-cutin-band,
@@ -2556,34 +3045,36 @@ const styles: Record<string, CSSProperties> = {
   oppDrawnGap: { marginRight: "calc(var(--o) * 0.25)" },
   muted: { opacity: 0.7, fontSize: "max(0.72rem, calc(var(--t) * 0.27))", margin: 0 },
   // On the cream result cards the table's light text would vanish, so these are dark.
-  cardMuted: { margin: 0, color: "#4b5563", fontSize: "0.95rem" },
-  cardNote: { margin: 0, color: "#374151", fontSize: "0.9rem", fontWeight: 600 },
+  cardMuted: { margin: 0, color: "rgba(244,239,224,0.68)", fontSize: "0.95rem" },
+  cardNote: { margin: 0, color: "rgba(244,239,224,0.68)", fontSize: "0.85rem", fontWeight: 600 },
   // Result cards are cream, so these are dark. Amounts are right-aligned in a column.
-  paymentList: { listStyle: "none", margin: 0, padding: 0, width: "100%", display: "flex", flexDirection: "column", gap: 4 },
+  paymentList: { listStyle: "none", margin: 0, padding: 0, width: "100%", minWidth: 0, display: "flex", flexDirection: "column", gap: 4 },
   paymentRow: {
     display: "flex",
     justifyContent: "space-between",
-    gap: 12,
+    flexWrap: "wrap",
+    minWidth: 0,
+    gap: "2px 12px",
     padding: "6px 12px",
-    borderRadius: 9999,
-    background: "rgba(31,36,48,0.07)",
-    color: "#1f2430",
+    borderRadius: 18,
+    background: "rgba(255,255,255,0.07)",
+    color: "#f4efe0",
     fontSize: "0.95rem",
   },
-  paymentAmount: { fontWeight: 800, color: "#15803d", fontVariantNumeric: "tabular-nums" },
-  leaderboard: { listStyle: "none", margin: 0, padding: 0, width: "100%", display: "flex", flexDirection: "column", gap: 6 },
+  paymentAmount: { fontWeight: 800, color: "#7ee2a1", fontVariantNumeric: "tabular-nums" },
+  leaderboard: { listStyle: "none", margin: 0, padding: 0, width: "100%", minWidth: 0, display: "flex", flexDirection: "column", gap: 6 },
   leaderRow: {
     display: "grid",
-    gridTemplateColumns: "3.2em 1fr auto",
+    gridTemplateColumns: "3.2em minmax(0, 1fr) auto",
     alignItems: "center",
     gap: 10,
     padding: "8px 14px",
     borderRadius: 9999,
-    background: "rgba(31,36,48,0.07)",
-    color: "#1f2430",
+    background: "rgba(255,255,255,0.07)",
+    color: "#f4efe0",
     textAlign: "left",
   },
-  leaderFirst: { background: "#f2b134", fontWeight: 800 },
+  leaderFirst: { background: "#f2b134", color: "#3a2600", fontWeight: 800 },
   leaderRank: { fontWeight: 800 },
   leaderName: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   leaderScore: { fontWeight: 800, fontVariantNumeric: "tabular-nums" },
@@ -2753,12 +3244,14 @@ const styles: Record<string, CSSProperties> = {
   river: { display: "grid", gap: 0 },
   riverCell: {
     position: "relative",
+    borderRadius: TILE_RADIUS,
     width: "var(--r)",
     height: "calc(var(--r) * 1.3334)",
     boxSizing: "border-box",
   },
   riverCellSide: {
     position: "relative",
+    borderRadius: TILE_RADIUS_SIDEWAYS,
     width: "calc(var(--r) * 1.3334)",
     height: "var(--r)",
     boxSizing: "border-box",
@@ -2854,6 +3347,25 @@ const styles: Record<string, CSSProperties> = {
     textShadow: "0 2px 6px rgba(0,0,0,0.5)",
   },
   compassRound: { fontSize: "calc(var(--r) * 0.5)", fontWeight: 800, letterSpacing: "0.04em", whiteSpace: "nowrap" },
+  // The one-line announcement of the roll, hung just below the hub (the rivers are still empty
+  // when a hand begins). It is wider than the hub, so it never wraps.
+  rollPill: {
+    position: "absolute",
+    top: "calc(100% + var(--r) * 0.25)",
+    left: "50%",
+    transform: "translateX(-50%)",
+    zIndex: 7,
+    padding: "calc(var(--r) * 0.16) calc(var(--r) * 0.6)",
+    borderRadius: "var(--oj-radius-sm)",
+    boxShadow: "0 6px 16px rgba(0,0,0,0.4)",
+    color: "var(--oj-gold)",
+    fontSize: "calc(var(--r) * 0.46)",
+    fontWeight: 700,
+    letterSpacing: "0.02em",
+    whiteSpace: "nowrap",
+    pointerEvents: "none",
+  },
+  wallRing: { position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" },
   compassHand: { fontSize: "calc(var(--r) * 0.4)", opacity: 0.75, whiteSpace: "nowrap" },
   timerCompass: { display: "flex", flexDirection: "column", alignItems: "center", gap: "calc(var(--r) * 0.06)", width: "62%" },
   timerSeconds: {
@@ -2984,14 +3496,10 @@ const styles: Record<string, CSSProperties> = {
     color: "#f4efe0",
     textShadow: "0 2px 6px rgba(0,0,0,0.7)",
   },
-  // The ring is a box-shadow (the equivalent of ring-4 ring-blue-500); the slot keeps the
-  // layout identical whether or not a tile is highlighted.
-  coachSlot: { display: "flex", borderRadius: 8 },
-  coachRing: {
-    display: "flex",
-    borderRadius: 8,
-    boxShadow: "0 0 0 4px #3b82f6",
-  },
+  // The slot is exactly the size of its tile and has the tile's own corner shape (the same
+  // percentages TileView uses), so a ring drawn around the slot hugs the tile. A box-shadow's
+  // corner is the slot's radius plus the ring's width, so it stays smoothly rounded.
+  coachSlot: { display: "flex", borderRadius: TILE_RADIUS },
   overlay: {
     position: "fixed",
     inset: 0,
@@ -3045,11 +3553,13 @@ const styles: Record<string, CSSProperties> = {
     gap: 6,
     padding: "4px 12px",
     borderRadius: 9999,
-    background: "#1f2430",
-    color: "#fbf7ea",
+    background: "rgba(255,255,255,0.1)",
+    border: "1px solid rgba(255,255,255,0.16)",
+    color: "#f4efe0",
     fontSize: "0.88rem",
     fontWeight: 700,
-    whiteSpace: "nowrap",
+    maxWidth: "100%",
+    minWidth: 0,
   },
   patternPillLimit: { background: "#f2b134", color: "#3a2600", boxShadow: "0 0 0 2px #b45309" },
   pillDot: { opacity: 0.6 },
@@ -3064,12 +3574,12 @@ const styles: Record<string, CSSProperties> = {
     alignItems: "center",
     gap: 2,
     padding: "10px 14px",
-    borderRadius: 14,
-    background: "#1f2430",
-    border: "2px solid #f2b134",
-    color: "#fbf7ea",
+    borderRadius: "max(14px, calc(var(--t, 44px) * 0.42))",
+    background: "rgba(0,0,0,0.28)",
+    border: "1.5px solid rgba(242,177,52,0.7)",
+    color: "#f4efe0",
   },
-  totalBoxLimit: { borderColor: "#fff3c4", background: "linear-gradient(180deg, #2b2410 0%, #1f2430 100%)" },
+  totalBoxLimit: { borderColor: "#fff3c4", background: "linear-gradient(180deg, rgba(60,45,10,0.7) 0%, rgba(0,0,0,0.3) 100%)" },
   totalTop: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, flexWrap: "wrap" },
   totalLabel: { fontSize: "0.8rem", letterSpacing: "0.12em", textTransform: "uppercase", opacity: 0.75 },
   totalFan: { fontSize: "2rem", fontWeight: 900, color: "#f2b134", lineHeight: 1.1 },
@@ -3088,11 +3598,13 @@ const styles: Record<string, CSSProperties> = {
     textTransform: "uppercase",
   },
   scoreHand: {
-    ["--tile-width" as string]: "clamp(20px, 5.5vw, 28px)",
+    ["--tile-width" as string]: "clamp(16px, 6cqi, 28px)",
     display: "flex",
     flexWrap: "wrap",
     justifyContent: "center",
     gap: 8,
     margin: "6px 0",
+    maxWidth: "100%",
+    minWidth: 0,
   },
 };

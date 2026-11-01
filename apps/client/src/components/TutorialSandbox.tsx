@@ -68,7 +68,7 @@ export const PUZZLES: Puzzle[] = [
     ]),
     hint: "Look for the tile that doesn't connect to anything else in your hand.",
     lesson:
-      "A wind or dragon with no partner can only ever grow into a pung, which needs two more identical tiles. Throw away lone honors first.",
+      "A wind or dragon with no partner can only ever grow into a pong, which needs two more identical tiles. Throw away lone honors first.",
   },
   {
     id: "lone-terminal",
@@ -106,7 +106,7 @@ export const PUZZLES: Puzzle[] = [
     ]),
     hint: "Two of the three honors in your hand are a matching pair.",
     lesson:
-      "A pair of dragons is worth keeping: a third one makes a pung that scores a fan by itself. The lone green dragon has no partner at all.",
+      "A pair of dragons is worth keeping: a third one makes a pong that scores a fan by itself. The lone green dragon has no partner at all.",
   },
 ];
 

@@ -1,32 +1,15 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
+import type { AnimationEvent } from "react";
 import type { CSSProperties } from "react";
 import { playSound } from "../audio";
 
-/* ---------- The roll itself ---------- */
-
-export interface DiceRollState {
-  /** Changes with every roll, so the same numbers twice in a row still replay the animation. */
-  readonly id: number;
-  readonly values: readonly [number, number];
-}
-
-let rollCounter = 0;
-
-/**
- * Two dice from a seed string. The same string always gives the same pair, so every screen
- * at the table shows the same roll for the same hand.
+/*
+ * The numbers are not chosen here. The engine decides the roll (generateDiceRoll) and hands it in
+ * as `targets`; this component only plays the dice falling onto exactly those two faces.
  */
-export function rollDice(seed: string): DiceRollState {
-  let h = 2166136261;
-  for (let i = 0; i < seed.length; i++) {
-    h ^= seed.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  h = (h ^ (h >>> 15)) >>> 0;
-  const a = (h % 6) + 1;
-  const b = (Math.floor(h / 6) % 6) + 1;
-  return { id: ++rollCounter, values: [a, b] };
-}
+
+/** Exactly two dice, each 1 to 6. The same shape the engine produces. */
+export type DiceTargets = [number, number];
 
 /* ---------- Timing ---------- */
 
@@ -108,6 +91,7 @@ function Die({ value, index, from }: { value: number; index: 0 | 1; from: 1 | -1
   return (
     <div
       className="ourjong-die-slide"
+      data-slide={index}
       style={
         {
           "--from": from,
@@ -120,7 +104,7 @@ function Die({ value, index, from }: { value: number; index: 0 | 1; from: 1 | -1
       }
     >
       <div className="ourjong-die-shadow" />
-      <div className="ourjong-die-bounce">
+      <div className="ourjong-die-bounce" data-die={index}>
         <div className="ourjong-die-cube" aria-hidden="true">
           {[1, 2, 3, 4, 5, 6].map((face) => (
             <Face key={face} face={face} />
@@ -134,43 +118,90 @@ function Die({ value, index, from }: { value: number; index: 0 | 1; from: 1 | -1
 /* ---------- The roll, drawn over the compass ---------- */
 
 /**
- * Two dice that tumble in over the middle of the table, bounce, and settle on `roll.values`.
- * Place it inside a positioned parent the size of the hub; it ignores the pointer and clears
- * itself (calling `onDone`) a moment after the dice stop.
+ * Two dice that tumble in over the middle of the table, bounce, and come to rest showing
+ * `targets`. Place it inside a positioned parent the size of the hub; it ignores the pointer.
+ *
+ *  - `dice-roll` plays the instant the throw starts.
+ *  - `onRollComplete` fires once, when the last die's animation ends: the dice have stopped.
+ *  - `onDismiss` (optional) fires after they have been left in view long enough to read and have
+ *    faded away.
+ *
+ * Give it a `key` that changes with each roll so a new roll starts a new animation.
  */
-export function DiceRoll({ roll, onDone }: { roll: DiceRollState; onDone: () => void }) {
+export function DiceRoll({
+  targets,
+  onRollComplete,
+  onDismiss,
+}: {
+  targets: DiceTargets;
+  onRollComplete: () => void;
+  onDismiss?: () => void;
+}) {
+  // The latest callbacks, so a parent that re-renders never restarts the animation.
+  const completeRef = useRef(onRollComplete);
+  const dismissRef = useRef(onDismiss);
+  completeRef.current = onRollComplete;
+  dismissRef.current = onDismiss;
+  const completed = useRef(false);
+  const dismissed = useRef(false);
+
+  const complete = () => {
+    if (completed.current) return;
+    completed.current = true;
+    completeRef.current();
+  };
+  const dismiss = () => {
+    if (dismissed.current) return;
+    dismissed.current = true;
+    dismissRef.current?.();
+  };
+
   useEffect(() => {
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     const timers: number[] = [];
+
+    // The rattle starts with the throw.
+    playSound("dice");
+
     if (!reduce) {
       [0, 1].forEach((die) => {
         const start = die * SECOND_DIE_DELAY_MS;
         IMPACTS.forEach((share, hit) => {
-          timers.push(
-            window.setTimeout(() => {
-              if (hit === 0) playSound("dice"); // placeholder asset: see audio.ts
-              diceHaptic(hit === 0 ? 1 : 2);
-            }, start + share * TUMBLE_MS),
-          );
+          timers.push(window.setTimeout(() => diceHaptic(hit === 0 ? 1 : 2), start + share * TUMBLE_MS));
         });
       });
     }
-    timers.push(window.setTimeout(onDone, (reduce ? 0 : TUMBLE_MS + SECOND_DIE_DELAY_MS) + HOLD_MS + FADE_MS));
+
+    // The animation events below are the real signal. These are only a net under them, for a
+    // browser that never fires them (reduced motion, a tab that was hidden), so the game can
+    // never be left waiting on dice that have already stopped.
+    const tumble = reduce ? 0 : TUMBLE_MS + SECOND_DIE_DELAY_MS;
+    timers.push(window.setTimeout(complete, tumble + 600));
+    timers.push(window.setTimeout(dismiss, tumble + HOLD_MS + FADE_MS + 600));
     return () => timers.forEach((t) => window.clearTimeout(t));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roll.id]);
+  }, []);
+
+  // Only the second die matters: it is thrown last, so when it stops, both have.
+  const onEnd = (event: AnimationEvent<HTMLDivElement>) => {
+    if (event.animationName === "ourjong-die-bounce" && event.target instanceof HTMLElement) {
+      if (event.target.dataset["die"] === "1") complete();
+    } else if (event.animationName === "ourjong-dice-out") {
+      if (event.target instanceof HTMLElement && event.target.dataset["slide"] === "1") dismiss();
+    }
+  };
 
   return (
     <div
-      key={roll.id}
       className="ourjong-dice"
       style={layerStyle}
       role="img"
-      aria-label={`Dice rolled ${roll.values[0]} and ${roll.values[1]}`}
+      aria-label={`Dice rolled ${targets[0]} and ${targets[1]}`}
+      onAnimationEnd={onEnd}
     >
       <style>{DICE_CSS}</style>
-      <Die value={roll.values[0]} index={0} from={-1} />
-      <Die value={roll.values[1]} index={1} from={1} />
+      <Die value={targets[0]} index={0} from={-1} />
+      <Die value={targets[1]} index={1} from={1} />
     </div>
   );
 }

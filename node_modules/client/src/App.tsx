@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { initializeHKOSGame, processAction } from "@ourjong/engine";
 import type { GameAction, GameState, SeatIndex } from "@ourjong/engine";
@@ -6,6 +6,9 @@ import { GameTable } from "./components/GameTable";
 import { Lobby } from "./components/Lobby";
 import { ReferenceGuide } from "./components/ReferenceGuide";
 import { TutorialSandbox } from "./components/TutorialSandbox";
+import { DIFFICULTIES, loadDifficulty, saveDifficulty } from "./difficulty";
+import type { BotLevel } from "@ourjong/engine";
+import { INITIAL_DICE_FLOW, diceKeyOf, diceReducer, startRoll } from "./diceFlow";
 import { useMultiplayer } from "./network/useMultiplayer";
 import { DEFAULT_SEAT_SETUP, PassAndPlayTable, SeatSetupScreen, humanSeatsOf } from "./components/PassAndPlay";
 import type { SeatSetup } from "./components/PassAndPlay";
@@ -71,6 +74,14 @@ export default function App() {
     dispatchToEngine(action);
   }, []);
   const [view, setView] = useState<View>("menu");
+
+  // The opening dice. Each time a hand is dealt the engine works out the roll first; the table
+  // then plays the dice onto exactly those numbers and the game waits until they settle.
+  const [dice, dispatchDice] = useReducer(diceReducer, INITIAL_DICE_FLOW);
+  useLayoutEffect(() => {
+    if (state.phase.type !== "setup" || dice.key === diceKeyOf(state)) return;
+    dispatchDice(startRoll(state)); // before the first paint, so nothing flashes unrolled
+  }, [state, dice.key]);
   const [mode, setMode] = useState<Mode>("local");
   // The kind of game that is actually running (the menu's choice only applies to the next one).
   const [gameMode, setGameMode] = useState<Mode>("local");
@@ -80,6 +91,13 @@ export default function App() {
   // Local-play aids. They live in the top bar and are handed to the table.
   const [coachOn, setCoachOn] = useState(false);
   const [peekOn, setPeekOn] = useState(false);
+  // How strong the bots are. One setting for the whole app, remembered between visits; the tables
+  // read it live, so changing it mid-game applies from the bots' next move.
+  const [botLevel, setBotLevelState] = useState<BotLevel>(loadDifficulty);
+  const setBotLevel = useCallback((level: BotLevel) => {
+    setBotLevelState(level);
+    saveDifficulty(level);
+  }, []);
   // Emoji floating over each seat (absolute seat numbers). `id` changes on every send so the
   // same emoji can be sent twice in a row and restart its animation.
   const [emojis, setEmojis] = useState<Partial<Record<number, { id: number; emoji: string }>>>({});
@@ -160,6 +178,8 @@ export default function App() {
           onStart={startGame}
           onResume={resumable ? () => setView("play") : null}
           onOpen={setView}
+          botLevel={botLevel}
+          onBotLevel={setBotLevel}
         />
       </div>
     );
@@ -193,6 +213,8 @@ export default function App() {
         onCoach={setCoachOn}
         peekOn={peekOn}
         onPeek={setPeekOn}
+        botLevel={botLevel}
+        onBotLevel={setBotLevel}
         confirmLeave={confirmLeave}
         onLeave={leaveTable}
         onGo={setView}
@@ -202,9 +224,12 @@ export default function App() {
         {view === "play" && gameMode === "hotseat" && (
           <PassAndPlayTable
             key={state.random.seed}
+            dice={dice}
+            onDiceAction={dispatchDice}
             state={state}
             dispatch={dispatch}
             humanSeats={humanSeatsOf(seatSetup)}
+            botLevel={botLevel}
             emojis={emojis}
             onEmojiDone={clearEmoji}
             onViewSeat={setHotseatView}
@@ -212,7 +237,7 @@ export default function App() {
         )}
 
         {view === "play" && gameMode === "local" && (
-          <GameTable gameState={state} onPlayerAction={dispatch} coachOn={coachOn} peek={peekOn} emojis={emojis} onEmojiDone={clearEmoji} />
+          <GameTable gameState={state} onPlayerAction={dispatch} dice={dice} onDiceAction={dispatchDice} coachOn={coachOn} botLevel={botLevel} peek={peekOn} emojis={emojis} onEmojiDone={clearEmoji} />
         )}
 
         {view === "play" &&
@@ -342,6 +367,8 @@ function CornerMenu({
   onCoach,
   peekOn,
   onPeek,
+  botLevel,
+  onBotLevel,
   confirmLeave,
   onLeave,
   onGo,
@@ -353,6 +380,8 @@ function CornerMenu({
   onCoach: (on: boolean) => void;
   peekOn: boolean;
   onPeek: (on: boolean) => void;
+  botLevel: BotLevel;
+  onBotLevel: (level: BotLevel) => void;
   confirmLeave: boolean;
   onLeave: () => void;
   onGo: (view: View) => void;
@@ -437,6 +466,13 @@ function CornerMenu({
               <div style={styles.itemRule} role="separator" />
               <Switch block label="Coach" on={coachOn} onChange={onCoach} icon={<BulbIcon />} />
               <Switch block label="Peek" on={peekOn} onChange={onPeek} icon={<EyeIcon />} />
+            </>
+          )}
+
+          {playing && mode !== "online" && (
+            <>
+              <div style={styles.itemRule} role="separator" />
+              <DifficultyPicker value={botLevel} onChange={onBotLevel} compact />
             </>
           )}
 
@@ -552,6 +588,54 @@ function SocialMenu({ onEmoji }: { onEmoji: (emoji: string) => void }) {
   );
 }
 
+/* ---------- AI difficulty ---------- */
+
+/**
+ * Novice / Intermediate / Expert as a segmented control. On the main menu it sits under the game
+ * mode; in the in-game menu (`compact`) it is a labelled row that fits the dropdown.
+ */
+function DifficultyPicker({
+  value,
+  onChange,
+  compact = false,
+}: {
+  value: BotLevel;
+  onChange: (level: BotLevel) => void;
+  compact?: boolean;
+}) {
+  const current = DIFFICULTIES.find((d) => d.level === value) ?? DIFFICULTIES[0];
+  return (
+    <div style={compact ? styles.diffCompact : styles.diffWrap}>
+      <span style={styles.diffLabel} id={compact ? "oj-diff-label-in" : "oj-diff-label"}>
+        AI difficulty
+      </span>
+      <div
+        style={compact ? { ...styles.menuModes, ...styles.diffTrack } : { ...styles.menuModes, marginTop: 0 }}
+        role="radiogroup"
+        aria-labelledby={compact ? "oj-diff-label-in" : "oj-diff-label"}
+      >
+        {DIFFICULTIES.map((item) => (
+          <button
+            key={item.level}
+            type="button"
+            role="radio"
+            aria-checked={value === item.level}
+            title={item.hint}
+            onClick={() => onChange(item.level)}
+            style={{
+              ...(value === item.level ? styles.menuModeOn : styles.menuMode),
+              ...(compact ? styles.diffOptionCompact : null),
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      {!compact && <span style={styles.diffHint}>{current.hint}</span>}
+    </div>
+  );
+}
+
 /* ---------- Main menu ---------- */
 
 function MainMenu({
@@ -560,12 +644,16 @@ function MainMenu({
   onStart,
   onResume,
   onOpen,
+  botLevel,
+  onBotLevel,
 }: {
   mode: Mode;
   onMode: (mode: Mode) => void;
   onStart: () => void;
   onResume: (() => void) | null;
   onOpen: (view: View) => void;
+  botLevel: BotLevel;
+  onBotLevel: (level: BotLevel) => void;
 }) {
   return (
     <main className="oj-menu" style={styles.menu}>
@@ -600,6 +688,8 @@ function MainMenu({
             </button>
           ))}
         </div>
+
+        {mode !== "online" && <DifficultyPicker value={botLevel} onChange={onBotLevel} />}
 
         <div style={styles.menuLinks}>
           <button type="button" className="oj-link" style={styles.menuLink} onClick={() => onOpen("guide")}>
@@ -959,6 +1049,12 @@ const styles: Record<string, CSSProperties> = {
     boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
     transition: "background 150ms ease, color 150ms ease",
   },
+  diffWrap: { display: "flex", flexDirection: "column", alignItems: "center", gap: 6, marginTop: "clamp(6px, 1.6vmin, 14px)", maxWidth: "100%" },
+  diffCompact: { display: "flex", flexDirection: "column", gap: 6, padding: "6px 8px 8px" },
+  diffLabel: { fontSize: "0.72rem", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", color: "rgba(244,239,224,0.6)" },
+  diffTrack: { marginTop: 0, width: "100%" },
+  diffOptionCompact: { flex: "1 1 auto", minWidth: 0, padding: "0 8px", fontSize: "0.78rem", letterSpacing: 0 },
+  diffHint: { fontSize: "0.8rem", color: "rgba(244,239,224,0.6)", textAlign: "center", maxWidth: 280, padding: "0 12px" },
   menuLinks: { display: "flex", alignItems: "center", gap: 6, marginTop: "clamp(4px, 1.2vmin, 12px)" },
   menuLink: {
     border: "none",

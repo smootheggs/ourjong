@@ -9,14 +9,14 @@ export const SOUND_FILES = {
   discard: "/sounds/clack.mp3",
   /** A tile drawn from the wall. */
   draw: "/sounds/clack.mp3",
-  /** Chow, pung or kong claimed. */
+  /** Chow, pong or kong claimed. */
   claim: "/sounds/claim.mp3",
   /** Declining a claim. */
   pass: "/sounds/clack.mp3",
   /** A hand won. */
   win: "/sounds/claim.mp3",
-  /** A die landing on the table (placeholder: swap in the final dice-rattle asset). */
-  dice: "/sounds/clack.mp3",
+  /** The dice, from the instant they are thrown. Add public/sounds/dice-roll.mp3. */
+  dice: "/sounds/dice-roll.mp3",
 } as const;
 
 export type SoundName = keyof typeof SOUND_FILES;

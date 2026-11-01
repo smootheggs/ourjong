@@ -76,7 +76,7 @@ const PATTERNS: Pattern[] = [
     zh: "平胡",
     en: "Common Hand",
     fan: 1,
-    rule: "Four chows and a pair of plain suit tiles: no pungs, and the pair is not winds or dragons.",
+    rule: "Four chows and a pair of plain suit tiles: no pongs, and the pair is not winds or dragons.",
     examples: [
       {
         groups: [
@@ -94,7 +94,7 @@ const PATTERNS: Pattern[] = [
     zh: "對對胡",
     en: "All in Triplets",
     fan: 3,
-    rule: "Four pungs or kongs and a pair, with no chows at all.",
+    rule: "Four pongs or kongs and a pair, with no chows at all.",
     examples: [
       {
         groups: [
@@ -148,7 +148,7 @@ const PATTERNS: Pattern[] = [
     zh: "小三元",
     en: "Small Three Dragons",
     fan: 5,
-    rule: "Pungs (or kongs) of two of the three dragons, plus a pair of the third. The pattern itself is worth 3 fan, and each of the two dragon pungs adds its own 1 fan, so the hand is 5 fan before anything else.",
+    rule: "Pongs (or kongs) of two of the three dragons, plus a pair of the third. The pattern itself is worth 3 fan, and each of the two dragon pongs adds its own 1 fan, so the hand is 5 fan before anything else.",
     examples: [
       {
         groups: [
@@ -166,7 +166,7 @@ const PATTERNS: Pattern[] = [
     zh: "小四喜",
     en: "Small Four Winds",
     fan: 6,
-    rule: "Pungs (or kongs) of three of the four winds, plus a pair of the fourth. Worth 6 fan; a seat or round wind pung, and a single-suit remainder, score on top.",
+    rule: "Pongs (or kongs) of three of the four winds, plus a pair of the fourth. Worth 6 fan; a seat or round wind pong, and a single-suit remainder, score on top.",
     examples: [
       {
         groups: [
@@ -232,9 +232,9 @@ const PATTERNS: Pattern[] = [
   {
     id: "dragon-pung",
     zh: "箭刻",
-    en: "Dragon Pung or Kong",
+    en: "Dragon Pong or Kong",
     fan: 1,
-    rule: "A pung or kong of red (紅中), green (發) or white (白板) dragons: 1 fan for each one you hold.",
+    rule: "A pong or kong of red (紅中), green (發) or white (白板) dragons: 1 fan for each one you hold.",
     examples: [
       {
         groups: [
@@ -261,7 +261,7 @@ const PATTERNS: Pattern[] = [
     zh: "門風",
     en: "Seat Wind",
     fan: 1,
-    rule: "A pung or kong of the wind that matches your own seat; here you sit East (東).",
+    rule: "A pong or kong of the wind that matches your own seat; here you sit East (東).",
     examples: [
       {
         groups: [
@@ -281,7 +281,7 @@ const PATTERNS: Pattern[] = [
     zh: "圈風",
     en: "Prevalent Wind",
     fan: 1,
-    rule: "A pung or kong of the wind of the current round; in a South round that is South (南).",
+    rule: "A pong or kong of the wind of the current round; in a South round that is South (南).",
     examples: [
       {
         groups: [
@@ -295,7 +295,7 @@ const PATTERNS: Pattern[] = [
         prevalent: "south",
       },
       {
-        caption: "When your seat wind is also the round wind, one pung scores both: 2 fan.",
+        caption: "When your seat wind is also the round wind, one pong scores both: 2 fan.",
         groups: [
           meld(dots(1, 2, 3)),
           meld(bamboo(4, 5, 6)),
@@ -483,7 +483,7 @@ export function ReferenceGuide() {
               <figure style={styles.meldExample}>
                 <div style={styles.group}>{bamboo(7, 7, 7).map(renderTile)}</div>
                 <figcaption style={styles.caption}>
-                  <strong style={styles.gold}>Pung 碰</strong> Three identical tiles.
+                  <strong style={styles.gold}>Pong 碰</strong> Three identical tiles.
                 </figcaption>
               </figure>
               <figure style={styles.meldExample}>
@@ -494,7 +494,7 @@ export function ReferenceGuide() {
               </figure>
             </div>
             <p style={styles.text}>
-              Winds and dragons can only form pungs and kongs, never chows.
+              Winds and dragons can only form pongs and kongs, never chows.
             </p>
           </RuleCard>
 
@@ -508,7 +508,7 @@ export function ReferenceGuide() {
           <RuleCard title="Claiming a discard">
             <ul style={styles.list}>
               <li>
-                <strong>Pung or kong:</strong> claim any player's discard when you hold the matching
+                <strong>Pong or kong:</strong> claim any player's discard when you hold the matching
                 tiles.
               </li>
               <li>
@@ -519,7 +519,7 @@ export function ReferenceGuide() {
                 <strong>Win:</strong> claim any discard that completes your hand.
               </li>
               <li>
-                <strong>Priority:</strong> a win beats a pung or kong, which beats a chow. A claim
+                <strong>Priority:</strong> a win beats a pong or kong, which beats a chow. A claim
                 skips everyone in between, and you discard next.
               </li>
             </ul>
@@ -531,7 +531,7 @@ export function ReferenceGuide() {
                 <strong>Concealed kong:</strong> four identical tiles from your own hand.
               </li>
               <li>
-                <strong>Added kong:</strong> the fourth tile joins one of your open pungs.
+                <strong>Added kong:</strong> the fourth tile joins one of your open pongs.
               </li>
               <li>
                 <strong>Exposed kong:</strong> claim a discard when you hold the other three.
@@ -541,7 +541,7 @@ export function ReferenceGuide() {
                 dead wall is topped up from the live wall so it stays 16 tiles.
               </li>
               <li>
-                <strong>Robbing the kong 搶槓:</strong> when someone adds to a pung, any player who
+                <strong>Robbing the kong 搶槓:</strong> when someone adds to a pong, any player who
                 could win on that tile may do so, and the kong never happens.
               </li>
             </ul>
