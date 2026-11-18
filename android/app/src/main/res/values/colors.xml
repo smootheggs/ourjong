@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The game's splash green (apps/client/vite.config.ts). -->
+    <color name="table">#12382D</color>
+    <color name="icon_background">#FFFFFF</color>
+</resources>

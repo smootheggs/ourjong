@@ -1,0 +1,23 @@
+# Installed packages: CI and every machine install them from package-lock.json.
+node_modules/
+
+# Build output: CI builds it.
+apps/client/dist/
+apps/*/dist/
+packages/*/dist/
+
+# Android build files
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/assets/www/
+
+# Keys never go in the repository (the debug key in android/app is public on purpose).
+*.p12
+*.jks
+.env
+.env.*
+
+.DS_Store
+*.log

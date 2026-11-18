@@ -10,6 +10,10 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
+      // The Android app (android/) carries the game in its APK, so it needs no service worker:
+      // build it with OURJONG_APK=1. The web build keeps the PWA as before.
+      disable: process.env.OURJONG_APK === "1",
+
       // A new build downloads in the background and takes over on the next launch, with no prompt.
       registerType: "autoUpdate",
 

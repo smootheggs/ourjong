@@ -1,0 +1,198 @@
+# Builds Ourjong for Android on GitHub's servers, so no computer is needed.
+#   web:     installs packages from package-lock.json, runs the engine's tests, builds the game.
+#            No secrets here, so nothing an npm package does can reach the signing key.
+#   android: packs that build into the APK and signs it with your key (SLOTH_KEYSTORE_* secrets;
+#            without them, the debug build). Fails if the APK asks for any permission.
+#   release: publishes each signed build of main as a GitHub release, for Obtainium.
+name: Build Ourjong APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/client/**"
+      - "packages/**"
+      - "android/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+# Every job only reads the code unless it says otherwise. Third-party steps are pinned to exact
+# commits, so a moved or hijacked tag can't swap in other code.
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "22"
+
+      # Exactly what package-lock.json lists. Install scripts are skipped: the tools need none.
+      - name: Install packages
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Engine tests
+        id: tests
+        continue-on-error: true
+        run: |
+          if npm test -w @ourjong/engine; then
+            echo "### ✅ Engine tests passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ⚠️ Engine tests failed: open the \"Engine tests\" step's log" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Engine tests failed"
+            exit 1
+          fi
+
+      - name: Build the game for the APK (no service worker)
+        env:
+          OURJONG_APK: "1"
+        run: npm run build -w client
+
+      - name: Upload the game
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ourjong-web
+          path: apps/client/dist
+          if-no-files-found: error
+
+  android:
+    needs: web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      signed: ${{ steps.apk.outputs.signed }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Get the game
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ourjong-web
+          path: android/app/src/main/assets/www
+
+      - name: Set up Java 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the SDK platform
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/android-sdk}}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || { echo "::error::sdkmanager not found in $SDK"; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          gradle-version: "8.11.1"
+          cache-read-only: false
+
+      - name: Build APK
+        id: apk
+        working-directory: android
+        env:
+          SLOTH_KEYSTORE_B64: ${{ secrets.SLOTH_KEYSTORE_B64 }}
+          SLOTH_KEYSTORE_PASSWORD: ${{ secrets.SLOTH_KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ -n "$SLOTH_KEYSTORE_B64" ] && [ -n "$SLOTH_KEYSTORE_PASSWORD" ]; then
+            echo "Building the release APK, signed with your private key"
+            echo "$SLOTH_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+            export SLOTH_KEYSTORE="$RUNNER_TEMP/release.p12"
+            gradle :app:assembleRelease --stacktrace
+            rm -f "$RUNNER_TEMP/release.p12"
+            cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/out/Ourjong.apk"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No release key in GitHub Secrets, so this is the debug build (debuggable, public debug key)."
+            gradle :app:assembleDebug --stacktrace
+            cp app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/out/Ourjong.apk"
+          fi
+
+      # The game never goes online and needs nothing from the tablet: no system permissions at all.
+      - name: Check the APK asks for no permissions
+        run: |
+          PERMS=$("$ANDROID_HOME"/build-tools/35.0.0/aapt2 dump permissions "$RUNNER_TEMP/out/Ourjong.apk")
+          echo "$PERMS"
+          # (AndroidX adds its own app-private DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION; that one is fine.)
+          if echo "$PERMS" | grep "uses-permission" | grep -qv "DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"; then
+            echo "::error::The APK asks for a permission. Ourjong should need none."
+            exit 1
+          fi
+          unzip -l "$RUNNER_TEMP/out/Ourjong.apk" | grep -q "assets/www/index.html" || { echo "::error::The game is missing from the APK"; exit 1; }
+          echo "No permissions, game inside: as intended."
+
+      - name: Read the version
+        id: version
+        run: |
+          LINE=$("$ANDROID_HOME"/build-tools/35.0.0/aapt2 dump badging "$RUNNER_TEMP/out/Ourjong.apk" | head -1)
+          echo "$LINE"
+          VERSION=$(echo "$LINE" | sed -n "s/.*versionName='\([0-9A-Za-z._-]*\)'.*/\1/p")
+          [ -n "$VERSION" ] || { echo "::error::Couldn't read the version"; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ourjong-apk
+          path: ${{ runner.temp }}/out/Ourjong.apk
+          if-no-files-found: error
+
+  # Only this job can write to the repository, and it runs no build tools: just the pinned
+  # download step and GitHub's own gh command. Debug builds are never published.
+  release:
+    needs: android
+    if: needs.android.outputs.signed == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Get the APK
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ourjong-apk
+          path: out
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.android.outputs.version }}
+        run: |
+          case "$VERSION" in *[!0-9A-Za-z._-]*|"") echo "::error::Unexpected version '$VERSION'"; exit 1;; esac
+          # One release per version, so Obtainium reads the same version as the app's own.
+          TAG="ourjong-v$VERSION"
+          ( cd out && sha256sum Ourjong.apk > Ourjong.apk.sha256 && cat Ourjong.apk.sha256 )
+          printf '%s\n' \
+            "Ourjong $VERSION, build $GITHUB_RUN_NUMBER, from commit ${GITHUB_SHA:0:7}." \
+            "" \
+            "Signed with the release key. SHA-256: $(cut -d' ' -f1 out/Ourjong.apk.sha256)" > notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then gh release delete "$TAG" --cleanup-tag --yes; fi
+          gh release create "$TAG" out/Ourjong.apk out/Ourjong.apk.sha256 \
+            --target "$GITHUB_SHA" --title "Ourjong $VERSION" --notes-file notes.md
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("ourjong-v"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+            while read -r OLD; do
+              [ -n "$OLD" ] && gh release delete "$OLD" --cleanup-tag --yes
+            done
