@@ -22,7 +22,6 @@ import {
   matchStatus,
   patternLabels,
   shanten,
-  shouldDeclareSelfDrawWin,
 } from "@ourjong/engine";
 import type {
   BotLevel,
@@ -127,9 +126,6 @@ const COACH_LEVEL: BotLevel = 3;
 // The bots' level comes from the app's difficulty setting (see ../difficulty.ts); this is only the
 // fallback for a table that is rendered without one: 1 Novice, 2 Intermediate, 3 Expert.
 const DEFAULT_BOT_LEVEL: BotLevel = 1;
-
-// Mirrors the engine's claim priority so a bot never sends a claim that is still blocked.
-const CLAIM_PRIORITY: Record<ClaimKind, number> = { chow: 1, pung: 2, kong: 2, win: 3 };
 
 /* ---------- Audio ---------- */
 
